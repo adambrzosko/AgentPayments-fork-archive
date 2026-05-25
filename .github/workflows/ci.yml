@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # ── Node SDK ────────────────────────────────────────────────────────────────
+  node-sdk:
+    name: Node SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Load SDK
+        run: node -e "require('./sdk/node/index.js'); console.log('Node SDK OK')"
+
+      - name: Syntax check — node_implementation
+        run: node --check node_implementation/server.js
+
+      - name: Syntax check — sdk/next
+        run: node --check sdk/next/index.js
+
+  # ── Edge SDK (ESM) ──────────────────────────────────────────────────────────
+  edge-sdk:
+    name: Edge SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Parse Edge SDK as ESM module
+        run: node --input-type=module < sdk/edge/index.js && echo "Edge SDK OK"
+
+      - name: Parse Cloudflare Worker
+        run: node --check edge_implementation/cloudflare_worker/src/worker.js
+
+  # ── Python SDK ──────────────────────────────────────────────────────────────
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install SDK and dependencies
+        run: pip install -e "sdk/python[django,fastapi,flask]"
+
+      - name: Syntax check — all SDK files
+        run: |
+          find sdk/python/agentpayments_python -name "*.py" | while read f; do
+            python3 -c "import ast; ast.parse(open('$f').read())" && echo "$f OK"
+          done
+
+      - name: Syntax check — Django implementation
+        run: |
+          find python_implementation/django -name "*.py" | while read f; do
+            python3 -c "import ast; ast.parse(open('$f').read())" && echo "$f OK"
+          done
+
+      - name: Django system check
+        working-directory: python_implementation/django
+        env:
+          CHALLENGE_SECRET: ci-test-secret-not-for-production
+          HOME_WALLET_ADDRESS: ""
+          SOLANA_RPC_URL: ""
+          USDC_MINT: ""
+        run: |
+          pip install -r requirements.txt
+          python manage.py check
+
+  # ── Constants parity ────────────────────────────────────────────────────────
+  constants-parity:
+    name: Constants parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify Edge SDK constants match constants.json
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          constants = json.loads(open("sdk/constants.json").read())
+          edge = open("sdk/edge/index.js").read()
+
+          def in_edge(value):
+              # Accept value wrapped in either single or double quotes
+              return f"'{value}'" in edge or f'"{value}"' in edge or str(value) in edge
+
+          mismatches = []
+          for name in ["COOKIE_NAME", "KEY_PREFIX", "USDC_MINT_MAINNET", "USDC_MINT_DEVNET", "MEMO_PROGRAM"]:
+              if not in_edge(constants[name]):
+                  mismatches.append(f"{name}: '{constants[name]}' not found in edge/index.js")
+          for name in ["COOKIE_MAX_AGE", "MIN_PAYMENT"]:
+              if str(constants[name]) not in edge:
+                  mismatches.append(f"{name}: {constants[name]} not found in edge/index.js")
+
+          if mismatches:
+              print("CONSTANTS MISMATCH:")
+              for m in mismatches:
+                  print(" ", m)
+              sys.exit(1)
+          else:
+              print("All constants match between constants.json and edge/index.js")
+          EOF
