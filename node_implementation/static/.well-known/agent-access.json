@@ -3,8 +3,8 @@
   "description": "This site gates AI agent access. Request any page without a key to receive a unique agent key and payment instructions. Once you have paid, include the key in all requests.",
   "protocol_version": "0.2",
   "flow": [
-    "1. Make any request to the site (e.g. GET /). You will receive a 402 response containing your unique agent key and payment details.",
-    "2. Send 0.01 USDC on Solana to the wallet address provided, with your agent key as the transaction memo.",
+    "1. Make any request to the site (e.g. GET /). You will receive a 402 response containing your unique agent key and exact payment details.",
+    "2. Send the USDC amount specified in the 402 response on Solana to the wallet address provided, with your agent key as the transaction memo.",
     "3. Retry your request with the header: X-Agent-Key: <your_key>"
   ],
   "access": {
@@ -14,7 +14,7 @@
   "payment": {
     "chain": "solana",
     "token": "USDC",
-    "amount": "0.01",
-    "instructions": "The wallet address is returned in the 402 response when you first hit the site. Send USDC on Solana to that address with your agent key as the memo."
+    "amount": "see_402_response",
+    "instructions": "The exact amount, wallet address, and your unique key are all returned in the 402 response when you first hit the site. Use those values — do not rely on the amount listed here."
   }
 }

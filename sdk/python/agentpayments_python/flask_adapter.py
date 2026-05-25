@@ -48,7 +48,15 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
                     "error": "payment_required",
                     "message": "Access requires a paid API key. A key has been generated for you below. Send a USDC payment on Solana with this key as the memo to activate it, then retry your request with the X-Agent-Key header.",
                     "your_key": new_key,
-                    "payment": {"chain": "solana", "network": network, "token": "USDC", "amount": str(MIN_PAYMENT), "wallet_address": home_wallet_address, "memo": new_key},
+                    "payment": {
+                        "chain": "solana",
+                        "network": network,
+                        "token": "USDC",
+                        "amount": str(MIN_PAYMENT),
+                        "wallet_address": home_wallet_address,
+                        "memo": new_key,
+                        "instructions": f'Send {MIN_PAYMENT} USDC on Solana {network} to {home_wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.',
+                    },
                 }), 402
             if not is_valid_agent_key(key, challenge_secret):
                 return jsonify({"error": "forbidden", "message": "Invalid API key."}), 403

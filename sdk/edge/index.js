@@ -56,16 +56,35 @@ function rateLimitCheck(key) {
   return entry.count <= RATE_LIMIT_MAX;
 }
 
-async function hmacSign(data, secret) {
+// Cache derived CryptoKey objects by secret so importKey isn't called on every
+// hmacSign invocation. Edge isolates reuse module-level state between requests.
+const _hmacKeyCache = new Map();
+
+async function _getHmacKey(secret) {
+  if (_hmacKeyCache.has(secret)) return _hmacKeyCache.get(secret);
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  _hmacKeyCache.set(secret, key);
+  return key;
+}
+
+async function hmacSign(data, secret) {
+  const key = await _getHmacKey(secret);
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
   return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Separate fixed key for timing-safe string comparison (never changes).
+let _tscKey = null;
+async function _getTimingSafeCmpKey() {
+  if (_tscKey) return _tscKey;
+  _tscKey = await crypto.subtle.importKey('raw', new TextEncoder().encode('timing-safe-cmp'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return _tscKey;
 }
 
 async function timingSafeEqual(a, b) {
   if (a.length !== b.length) return false;
   const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode('timing-safe-cmp'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const key = await _getTimingSafeCmpKey();
   const [macA, macB] = await Promise.all([
     crypto.subtle.sign('HMAC', key, enc.encode(a)),
     crypto.subtle.sign('HMAC', key, enc.encode(b)),
@@ -94,14 +113,26 @@ async function isValidAgentKey(key, secret) {
   return timingSafeEqual(sig, expected.slice(0, 16));
 }
 
-async function rpcCall(rpcUrl, method, params) {
-  const resp = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
-  if (!resp.ok) throw new Error(`RPC ${method} failed: ${resp.status}`);
-  return resp.json();
+async function rpcCall(rpcUrl, method, params, { retries = 2, backoffMs = 300 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, backoffMs * attempt));
+    try {
+      const resp = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      // Only retry on 5xx (server-side transient errors); 4xx are permanent.
+      if (resp.status >= 500) { lastError = new Error(`RPC ${method} failed: ${resp.status}`); continue; }
+      if (!resp.ok) throw new Error(`RPC ${method} failed: ${resp.status}`);
+      return resp.json();
+    } catch (err) {
+      if (err.message?.includes('failed:')) throw err; // re-throw permanent 4xx
+      lastError = err;
+    }
+  }
+  throw lastError;
 }
 
 async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint) {
@@ -114,7 +145,7 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint) {
     const allSignatures = [];
 
     for (const addr of addressesToScan) {
-      const sigsData = await rpcCall(rpcUrl, 'getSignaturesForAddress', [addr, { limit: 50 }]);
+      const sigsData = await rpcCall(rpcUrl, 'getSignaturesForAddress', [addr, { limit: 100 }]);
       for (const sig of sigsData.result || []) {
         if (!seen.has(sig.signature)) {
           seen.add(sig.signature);

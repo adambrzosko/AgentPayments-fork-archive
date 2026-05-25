@@ -87,17 +87,30 @@ function isValidAgentKey(key, secret) {
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected.slice(0, 16)));
 }
 
-async function rpcCall(rpcUrl, method, params) {
-  const resp = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
-  if (!resp.ok) throw new Error(`RPC ${method} failed: ${resp.status}`);
-  return resp.json();
+async function rpcCall(rpcUrl, method, params, { retries = 2, backoffMs = 300 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, backoffMs * attempt));
+    try {
+      const resp = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      // Only retry on 5xx (server-side transient errors); 4xx are permanent.
+      if (resp.status >= 500) { lastError = new Error(`RPC ${method} failed: ${resp.status}`); continue; }
+      if (!resp.ok) throw new Error(`RPC ${method} failed: ${resp.status}`);
+      return resp.json();
+    } catch (err) {
+      // Network/timeout errors are always retriable.
+      if (err.message?.includes('failed:')) throw err; // re-throw permanent 4xx
+      lastError = err;
+    }
+  }
+  throw lastError;
 }
 
-async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint) {
+async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, minPayment = MIN_PAYMENT) {
   try {
     const ataData = await rpcCall(rpcUrl, 'getTokenAccountsByOwner', [
       walletAddress,
@@ -111,7 +124,7 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint) {
     const allSignatures = [];
 
     for (const addr of addressesToScan) {
-      const sigsData = await rpcCall(rpcUrl, 'getSignaturesForAddress', [addr, { limit: 50 }]);
+      const sigsData = await rpcCall(rpcUrl, 'getSignaturesForAddress', [addr, { limit: 100 }]);
       for (const sig of sigsData.result || []) {
         if (!seen.has(sig.signature)) {
           seen.add(sig.signature);
@@ -149,7 +162,7 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint) {
             const info = parsed.info || {};
             if (parsed.type === 'transferChecked' && info.mint !== usdcMint) continue;
             const uiAmount = info.tokenAmount?.uiAmount ?? Number.parseFloat(info.amount || '0') / 1e6;
-            if (uiAmount >= MIN_PAYMENT) hasPayment = true;
+            if (uiAmount >= minPayment) hasPayment = true;
           }
         }
       }
@@ -242,6 +255,7 @@ function agentPaymentsGate(config = {}) {
     homeWalletAddress,
     solanaRpcUrl,
     usdcMint,
+    minPayment = MIN_PAYMENT,
     debug = process.env.DEBUG !== 'false',
   } = config;
 
@@ -322,10 +336,10 @@ function agentPaymentsGate(config = {}) {
             chain: 'solana',
             network,
             token: 'USDC',
-            amount: String(MIN_PAYMENT),
+            amount: String(minPayment),
             wallet_address: walletAddress,
             memo: newKey,
-            instructions: `Send ${MIN_PAYMENT} USDC on Solana ${debug ? 'devnet' : 'mainnet'} to ${walletAddress} with memo "${newKey}". Then include the header X-Agent-Key: ${newKey} on all subsequent requests.`,
+            instructions: `Send ${minPayment} USDC on Solana ${debug ? 'devnet' : 'mainnet'} to ${walletAddress} with memo "${newKey}". Then include the header X-Agent-Key: ${newKey} on all subsequent requests.`,
           },
         });
       }
@@ -344,7 +358,7 @@ function agentPaymentsGate(config = {}) {
 
       const cached = paymentCache.get(agentKey);
       if (cached === true) return next();
-      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, mint);
+      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, mint, minPayment);
       if (paid) paymentCache.set(agentKey, true);
       if (!paid) {
         return json(res, 402, {
@@ -355,7 +369,7 @@ function agentPaymentsGate(config = {}) {
             chain: 'solana',
             network,
             token: 'USDC',
-            amount: String(MIN_PAYMENT),
+            amount: String(minPayment),
             wallet_address: walletAddress,
             memo: agentKey,
           },

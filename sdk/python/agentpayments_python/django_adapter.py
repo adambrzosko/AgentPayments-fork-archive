@@ -1,4 +1,5 @@
 import hmac
+import logging
 import time
 
 from django.conf import settings
@@ -20,16 +21,16 @@ MAX_NONCE_LENGTH = _constants["MAX_NONCE_LENGTH"]
 MAX_RETURN_TO_LENGTH = _constants["MAX_RETURN_TO_LENGTH"]
 MAX_FP_LENGTH = _constants["MAX_FP_LENGTH"]
 
+logger = logging.getLogger("agentpayments")
+
 
 class GateMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
 
-    def __call__(self, request):
+        # Resolve and validate config once at startup, not per-request.
         secret = settings.CHALLENGE_SECRET
         if secret == "default-secret-change-me":
-            import logging
-            logger = logging.getLogger("agentpayments")
             if settings.DEBUG:
                 logger.warning("Using default CHALLENGE_SECRET. Set a strong secret before deploying to production.")
             else:
@@ -40,7 +41,18 @@ class GateMiddleware:
         debug = settings.DEBUG
         rpc_url = settings.SOLANA_RPC_URL or (RPC_DEVNET if debug else RPC_MAINNET)
         usdc_mint = settings.USDC_MINT or (USDC_MINT_DEVNET if debug else USDC_MINT_MAINNET)
-        network = "devnet" if debug else "mainnet-beta"
+
+        self.secret = secret
+        self.wallet_address = wallet_address
+        self.debug = debug
+        self.rpc_url = rpc_url
+        self.usdc_mint = usdc_mint
+        self.network = "devnet" if debug else "mainnet-beta"
+
+    def __call__(self, request):
+        secret = self.secret
+        wallet_address = self.wallet_address
+        network = self.network
 
         pathname = request.path
         if is_public_path(pathname):
@@ -68,6 +80,7 @@ class GateMiddleware:
                         "amount": str(MIN_PAYMENT),
                         "wallet_address": wallet_address,
                         "memo": new_key,
+                        "instructions": f'Send {MIN_PAYMENT} USDC on Solana {network} to {wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.',
                     },
                 }, status=402, json_dumps_params={"indent": 2})
 
@@ -77,7 +90,7 @@ class GateMiddleware:
             if not wallet_address:
                 return JsonResponse({"error": "server_error", "message": "Payment verification unavailable."}, status=500)
 
-            paid = verify_payment_on_chain(agent_key, wallet_address, rpc_url, usdc_mint)
+            paid = verify_payment_on_chain(agent_key, wallet_address, self.rpc_url, self.usdc_mint)
             if not paid:
                 return JsonResponse({
                     "error": "payment_required",

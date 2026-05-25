@@ -51,10 +51,25 @@ MEMO_PROGRAM = _constants["MEMO_PROGRAM"]
 MIN_PAYMENT = _constants["MIN_PAYMENT"]
 
 
-def _rpc_call(rpc_url: str, method: str, params: list) -> dict:
-    resp = requests.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+def _rpc_call(rpc_url: str, method: str, params: list, retries: int = 2, backoff: float = 0.3) -> dict:
+    last_error: Exception = RuntimeError("RPC call failed before any attempt")
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            import time as _sleep_time
+            _sleep_time.sleep(backoff * attempt)
+        try:
+            resp = requests.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=30)
+            # Only retry on 5xx (transient server errors); 4xx are permanent.
+            if resp.status_code >= 500:
+                last_error = requests.HTTPError(f"RPC {method} failed: {resp.status_code}", response=resp)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError:
+            raise  # permanent 4xx — don't retry
+        except Exception as exc:
+            last_error = exc
+    raise last_error
 
 
 def is_valid_solana_address(address: str) -> bool:
@@ -76,7 +91,7 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
         all_signatures = []
 
         for addr in addresses_to_scan:
-            sigs_data = _rpc_call(rpc_url, "getSignaturesForAddress", [addr, {"limit": 50}])
+            sigs_data = _rpc_call(rpc_url, "getSignaturesForAddress", [addr, {"limit": 100}])
             for sig in sigs_data.get("result", []):
                 if sig["signature"] not in seen:
                     seen.add(sig["signature"])

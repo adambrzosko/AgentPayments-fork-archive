@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import json
 import time
@@ -57,7 +58,15 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
                     "error": "payment_required",
                     "message": "Access requires a paid API key. A key has been generated for you below. Send a USDC payment on Solana with this key as the memo to activate it, then retry your request with the X-Agent-Key header.",
                     "your_key": new_key,
-                    "payment": {"chain": "solana", "network": network, "token": "USDC", "amount": str(MIN_PAYMENT), "wallet_address": self.home_wallet_address, "memo": new_key},
+                    "payment": {
+                        "chain": "solana",
+                        "network": network,
+                        "token": "USDC",
+                        "amount": str(MIN_PAYMENT),
+                        "wallet_address": self.home_wallet_address,
+                        "memo": new_key,
+                        "instructions": f'Send {MIN_PAYMENT} USDC on Solana {network} to {self.home_wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.',
+                    },
                 }, status_code=402)
 
             if not is_valid_agent_key(agent_key, self.challenge_secret):
@@ -66,7 +75,13 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
             if not self.home_wallet_address:
                 return JSONResponse({"error": "server_error", "message": "Payment verification unavailable."}, status_code=500)
 
-            if not verify_payment_on_chain(agent_key, self.home_wallet_address, self.solana_rpc_url, self.usdc_mint):
+            # verify_payment_on_chain is synchronous (uses requests). Run it in a
+            # thread-pool executor so it doesn't block the async event loop.
+            loop = asyncio.get_event_loop()
+            paid = await loop.run_in_executor(
+                None, verify_payment_on_chain, agent_key, self.home_wallet_address, self.solana_rpc_url, self.usdc_mint
+            )
+            if not paid:
                 return JSONResponse({
                     "error": "payment_required",
                     "message": "Key is valid but payment has not been verified on-chain yet.",
