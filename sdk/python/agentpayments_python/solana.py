@@ -85,6 +85,12 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
     try:
         ata_data = _rpc_call(rpc_url, "getTokenAccountsByOwner", [wallet_address, {"mint": usdc_mint}, {"encoding": "jsonParsed"}])
         token_accounts = [a["pubkey"] for a in ata_data.get("result", {}).get("value", [])]
+        # Only transfers landing in one of the vendor's USDC token accounts count as
+        # payment. Token accounts are mint-bound, so membership also guarantees the
+        # token is USDC for plain `transfer` instructions (which carry no mint field).
+        vendor_usdc_accounts = set(token_accounts)
+        if not vendor_usdc_accounts:
+            return False  # vendor has no USDC account yet — no payment possible
 
         addresses_to_scan = [wallet_address] + token_accounts
         seen = set()
@@ -129,6 +135,9 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
                     tx_type = parsed.get("type", "")
                     if tx_type in ("transfer", "transferChecked"):
                         info = parsed.get("info", {})
+                        # Payment must be delivered to one of the vendor's USDC token accounts.
+                        if info.get("destination") not in vendor_usdc_accounts:
+                            continue
                         if tx_type == "transferChecked" and info.get("mint") != usdc_mint:
                             continue
                         token_amount = info.get("tokenAmount", {})

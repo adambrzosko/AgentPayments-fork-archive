@@ -1,11 +1,12 @@
 import { createEdgeGate } from './index.js';
 
 export function createNetlifyGate(options = {}) {
-  const { publicPathAllowlist = [], minPayment } = options;
+  const { publicPathAllowlist = [], minPayment, powDifficulty } = options;
 
   const gate = createEdgeGate({
     publicPathAllowlist,
     minPayment,
+    powDifficulty,
     getClientIp: ({ context }) => context?.ip || 'unknown',
     envResolver: () => ({
       CHALLENGE_SECRET: Deno.env.get('CHALLENGE_SECRET') || 'default-secret-change-me',

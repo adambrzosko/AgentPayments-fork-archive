@@ -1,11 +1,12 @@
 import { createEdgeGate } from './index.js';
 
 export function createAgentPaymentsWorker(options = {}) {
-  const { assetsBinding = 'ASSETS', publicPathAllowlist = [], minPayment } = options;
+  const { assetsBinding = 'ASSETS', publicPathAllowlist = [], minPayment, powDifficulty } = options;
 
   const gate = createEdgeGate({
     publicPathAllowlist,
     minPayment,
+    powDifficulty,
     getClientIp: ({ request }) => request.headers.get('cf-connecting-ip') || 'unknown',
     fetchUpstream: (request, env) => {
       const binding = env[assetsBinding];

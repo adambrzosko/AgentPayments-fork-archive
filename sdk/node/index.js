@@ -5,6 +5,7 @@ const {
   RPC_DEVNET, RPC_MAINNET,
   MEMO_PROGRAM, MIN_PAYMENT,
   MAX_KEY_LENGTH, MAX_NONCE_LENGTH, MAX_RETURN_TO_LENGTH, MAX_FP_LENGTH,
+  POW_DIFFICULTY, MAX_POW_LENGTH, NONCE_TTL_MS,
 } = require('../constants.json');
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const PAYMENT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
@@ -70,6 +71,61 @@ function hmacSign(data, secret) {
   return crypto.createHmac('sha256', secret).update(data).digest('hex');
 }
 
+function sha256Hex(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+// Short HMAC of the client IP. Used to bind nonces and cookies to the client
+// that solved the challenge, so a captured cookie is useless from another IP.
+function clientIdForIp(ip, secret) {
+  return hmacSign(`client:${ip}`, secret).slice(0, 16);
+}
+
+function getClientIp(req) {
+  return req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
+}
+
+// Canvas fingerprints are a base64 slice of a data URL. Reject anything that
+// isn't base64 or is degenerate (e.g. a single repeated character).
+const FP_RE = /^[A-Za-z0-9+/]{10,}$/;
+function isPlausibleFingerprint(fp) {
+  return FP_RE.test(fp) && new Set(fp).size >= 4;
+}
+
+// Proof-of-work: sha256(`${nonce}:${pow}`) must start with `difficulty` zero
+// hex chars. Verification is a single hash; solving costs ~16^difficulty tries.
+function verifyPow(nonce, pow, difficulty) {
+  if (!/^\d{1,20}$/.test(pow)) return false;
+  return sha256Hex(`${nonce}:${pow}`).startsWith('0'.repeat(difficulty));
+}
+
+// Single-use nonce tracking (best-effort, in-memory).
+class ConsumedNonces {
+  constructor(ttl = NONCE_TTL_MS, maxSize = 10000) {
+    this.ttl = ttl;
+    this.maxSize = maxSize;
+    this.seen = new Map();
+  }
+  // Returns true if the nonce was fresh (and marks it consumed).
+  consume(sig) {
+    const now = Date.now();
+    const exp = this.seen.get(sig);
+    if (exp !== undefined && exp > now) return false;
+    if (this.seen.size >= this.maxSize) {
+      const oldest = this.seen.keys().next().value;
+      this.seen.delete(oldest);
+    }
+    this.seen.set(sig, now + this.ttl);
+    return true;
+  }
+  cleanup() {
+    const now = Date.now();
+    for (const [sig, exp] of this.seen) {
+      if (exp <= now) this.seen.delete(sig);
+    }
+  }
+}
+
 function generateAgentKey(secret) {
   const random = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
   const sig = hmacSign(random, secret);
@@ -119,6 +175,12 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, m
     ]);
 
     const tokenAccounts = (ataData.result?.value || []).map((a) => a.pubkey);
+    // Only transfers landing in one of the vendor's USDC token accounts count as
+    // payment. Token accounts are mint-bound, so membership also guarantees the
+    // token is USDC for plain `transfer` instructions (which carry no mint field).
+    const vendorUsdcAccounts = new Set(tokenAccounts);
+    if (vendorUsdcAccounts.size === 0) return false; // vendor has no USDC account yet — no payment possible
+
     const addressesToScan = [walletAddress, ...tokenAccounts];
     const seen = new Set();
     const allSignatures = [];
@@ -160,6 +222,8 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, m
           const parsed = ix.parsed || {};
           if (parsed.type === 'transfer' || parsed.type === 'transferChecked') {
             const info = parsed.info || {};
+            // Payment must be delivered to one of the vendor's USDC token accounts.
+            if (!vendorUsdcAccounts.has(info.destination)) continue;
             if (parsed.type === 'transferChecked' && info.mint !== usdcMint) continue;
             const uiAmount = info.tokenAmount?.uiAmount ?? Number.parseFloat(info.amount || '0') / 1e6;
             if (uiAmount >= minPayment) hasPayment = true;
@@ -194,7 +258,9 @@ function isValidCookie(req, secret) {
   const ts = Number.parseInt(timestamp, 10);
   if (Number.isNaN(ts) || Date.now() - ts > COOKIE_MAX_AGE * 1000) return false;
 
-  const expected = hmacSign(timestamp, secret);
+  // Cookie signature is bound to the client IP that solved the challenge.
+  const clientId = clientIdForIp(getClientIp(req), secret);
+  const expected = hmacSign(`cookie:${timestamp}:${clientId}`, secret);
   if (signature.length !== expected.length) return false;
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
@@ -209,7 +275,7 @@ function isBrowser(req) {
   return Boolean(req.headers['sec-fetch-mode'] || req.headers['sec-fetch-dest']);
 }
 
-function challengePage(returnTo, nonce) {
+function challengePage(returnTo, nonce, powDifficulty = POW_DIFFICULTY) {
   const safePath = returnTo.startsWith('/') ? returnTo : '/';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -228,6 +294,7 @@ function challengePage(returnTo, nonce) {
   <script>
     (function() {
       if (navigator.webdriver) return;
+      if (!window.crypto || !window.crypto.subtle) return;
       var c = document.createElement("canvas"); c.width = 200; c.height = 50;
       var ctx = c.getContext("2d");
       if (!ctx) return;
@@ -235,10 +302,25 @@ function challengePage(returnTo, nonce) {
       var data = c.toDataURL();
       if (!data || data.length < 100) return;
       if (typeof window.innerWidth === "undefined" || window.innerWidth === 0) return;
-      var form = document.createElement("form"); form.method = "POST"; form.action = "/__challenge/verify";
-      var fields = { nonce: ${JSON.stringify(nonce)}, return_to: ${JSON.stringify(safePath)}, fp: data.slice(22, 86) };
-      for (var key in fields) { var input = document.createElement("input"); input.type = "hidden"; input.name = key; input.value = fields[key]; form.appendChild(input); }
-      document.body.appendChild(form); form.submit();
+      var nonce = ${JSON.stringify(nonce)};
+      var target = ${JSON.stringify('0'.repeat(powDifficulty))};
+      var enc = new TextEncoder();
+      var i = 0;
+      function submit(pow) {
+        var form = document.createElement("form"); form.method = "POST"; form.action = "/__challenge/verify";
+        var fields = { nonce: nonce, return_to: ${JSON.stringify(safePath)}, fp: data.slice(22, 86), pow: pow };
+        for (var key in fields) { var input = document.createElement("input"); input.type = "hidden"; input.name = key; input.value = fields[key]; form.appendChild(input); }
+        document.body.appendChild(form); form.submit();
+      }
+      function mine() {
+        window.crypto.subtle.digest("SHA-256", enc.encode(nonce + ":" + i)).then(function(buf) {
+          var b = new Uint8Array(buf); var h = "";
+          for (var j = 0; j < 4; j++) h += (b[j] < 16 ? "0" : "") + b[j].toString(16);
+          if (h.slice(0, target.length) === target) return submit(String(i));
+          i++; mine();
+        });
+      }
+      mine();
     })();
   </script>
 </body>
@@ -256,6 +338,7 @@ function agentPaymentsGate(config = {}) {
     solanaRpcUrl,
     usdcMint,
     minPayment = MIN_PAYMENT,
+    powDifficulty = POW_DIFFICULTY,
     debug = process.env.DEBUG !== 'false',
   } = config;
 
@@ -276,7 +359,8 @@ function agentPaymentsGate(config = {}) {
   const network = debug ? 'devnet' : 'mainnet-beta';
   const paymentCache = new PaymentCache();
   const rateLimiter = new RateLimiter();
-  setInterval(() => rateLimiter.cleanup(), 60000).unref();
+  const consumedNonces = new ConsumedNonces();
+  setInterval(() => { rateLimiter.cleanup(); consumedNonces.cleanup(); }, 60000).unref();
 
   return async function agentPaymentsGateMiddleware(req, res, next) {
     const pathname = req.path;
@@ -284,33 +368,44 @@ function agentPaymentsGate(config = {}) {
     if (isPublicPath(pathname)) return next();
 
     if (pathname === '/__challenge/verify' && req.method === 'POST') {
-      const clientIp = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
+      const clientIp = getClientIp(req);
       if (!rateLimiter.check(clientIp)) {
         return json(res, 429, { error: 'rate_limited', message: 'Too many verification attempts. Please wait and try again.' });
       }
       const nonce = (req.body?.nonce || req.query?.nonce || '').slice(0, MAX_NONCE_LENGTH);
       const returnTo = (req.body?.return_to || req.query?.return_to || '/').slice(0, MAX_RETURN_TO_LENGTH);
       const fp = (req.body?.fp || req.query?.fp || '').slice(0, MAX_FP_LENGTH);
+      const pow = (req.body?.pow || req.query?.pow || '').slice(0, MAX_POW_LENGTH);
 
-      const dotIndex = nonce.indexOf('.');
-      if (dotIndex === -1 || !fp || fp.length < 10) {
+      // Nonce format: <ts>.<rand>.<sig>
+      const [nonceTs, nonceRand, nonceSig] = nonce.split('.');
+      if (!nonceTs || !nonceRand || !nonceSig || !isPlausibleFingerprint(fp)) {
         return json(res, 403, { error: 'forbidden', message: 'Challenge verification failed.' });
       }
 
-      const nonceTs = nonce.slice(0, dotIndex);
-      const nonceSig = nonce.slice(dotIndex + 1);
       const ts = Number.parseInt(nonceTs, 10);
-      if (Number.isNaN(ts) || Date.now() - ts > 300000) {
+      if (Number.isNaN(ts) || Date.now() - ts > NONCE_TTL_MS) {
         return json(res, 403, { error: 'forbidden', message: 'Challenge expired. Reload the page.' });
       }
 
-      const expectedSig = hmacSign(`nonce:${nonceTs}`, secret);
+      // Nonce is bound to the IP it was issued to.
+      const clientId = clientIdForIp(clientIp, secret);
+      const expectedSig = hmacSign(`nonce:${nonceTs}:${nonceRand}:${clientId}`, secret);
       if (nonceSig.length !== expectedSig.length || !crypto.timingSafeEqual(Buffer.from(nonceSig), Buffer.from(expectedSig))) {
         return json(res, 403, { error: 'forbidden', message: 'Invalid challenge.' });
       }
 
+      if (!verifyPow(nonce, pow, powDifficulty)) {
+        return json(res, 403, { error: 'forbidden', message: 'Challenge verification failed.' });
+      }
+
+      // Single use: a solved nonce cannot mint a second cookie.
+      if (!consumedNonces.consume(nonceSig)) {
+        return json(res, 403, { error: 'forbidden', message: 'Challenge expired. Reload the page.' });
+      }
+
       const now = Date.now().toString();
-      const cookieSig = hmacSign(now, secret);
+      const cookieSig = hmacSign(`cookie:${now}:${clientId}`, secret);
       const safePath = returnTo.startsWith('/') ? returnTo : '/';
 
       res.cookie(COOKIE_NAME, `${now}.${cookieSig}`, {
@@ -382,8 +477,10 @@ function agentPaymentsGate(config = {}) {
     if (isValidCookie(req, secret)) return next();
 
     const nonceTs = Date.now().toString();
-    const nonceSig = hmacSign(`nonce:${nonceTs}`, secret);
-    return res.status(200).set('Cache-Control', 'no-store').set('Content-Type', 'text/html').send(challengePage(req.originalUrl || req.url, `${nonceTs}.${nonceSig}`));
+    const nonceRand = crypto.randomBytes(8).toString('hex');
+    const nonceClientId = clientIdForIp(getClientIp(req), secret);
+    const nonceSig = hmacSign(`nonce:${nonceTs}:${nonceRand}:${nonceClientId}`, secret);
+    return res.status(200).set('Cache-Control', 'no-store').set('Content-Type', 'text/html').send(challengePage(req.originalUrl || req.url, `${nonceTs}.${nonceRand}.${nonceSig}`, powDifficulty));
   };
 }
 

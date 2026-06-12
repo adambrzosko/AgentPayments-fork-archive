@@ -1,15 +1,13 @@
-import hmac
 import logging
-import time
 
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-from .challenge import challenge_html
+from .challenge import POW_DIFFICULTY, challenge_html, make_nonce, validate_challenge_submission
 from .cookies import COOKIE_MAX_AGE, COOKIE_NAME, is_valid_cookie_value, make_cookie
-from .crypto import generate_agent_key, hmac_sign, is_valid_agent_key
+from .crypto import generate_agent_key, is_valid_agent_key
 from .detection import is_browser_from_headers, is_public_path
 from .ratelimit import _challenge_limiter
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
@@ -20,8 +18,13 @@ _constants = _json.loads((_Path(__file__).resolve().parent.parent.parent / "cons
 MAX_NONCE_LENGTH = _constants["MAX_NONCE_LENGTH"]
 MAX_RETURN_TO_LENGTH = _constants["MAX_RETURN_TO_LENGTH"]
 MAX_FP_LENGTH = _constants["MAX_FP_LENGTH"]
+MAX_POW_LENGTH = _constants["MAX_POW_LENGTH"]
 
 logger = logging.getLogger("agentpayments")
+
+
+def _client_ip(request):
+    return request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip() or request.META.get("REMOTE_ADDR", "unknown")
 
 
 class GateMiddleware:
@@ -48,6 +51,7 @@ class GateMiddleware:
         self.rpc_url = rpc_url
         self.usdc_mint = usdc_mint
         self.network = "devnet" if debug else "mainnet-beta"
+        self.pow_difficulty = getattr(settings, "POW_DIFFICULTY", POW_DIFFICULTY)
 
     def __call__(self, request):
         secret = self.secret
@@ -108,50 +112,37 @@ class GateMiddleware:
 
             return self.get_response(request)
 
+        client_ip = _client_ip(request)
         cookie_val = request.COOKIES.get(COOKIE_NAME, "")
-        if is_valid_cookie_value(cookie_val, secret):
+        if is_valid_cookie_value(cookie_val, secret, client_ip):
             return self.get_response(request)
 
-        nonce_ts = str(int(time.time() * 1000))
-        nonce = f"{nonce_ts}.{hmac_sign(f'nonce:{nonce_ts}', secret)}"
-        return HttpResponse(challenge_html(request.get_full_path(), nonce), content_type="text/html", headers={"Cache-Control": "no-store"})
+        nonce = make_nonce(secret, client_ip)
+        return HttpResponse(challenge_html(request.get_full_path(), nonce, self.pow_difficulty), content_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @csrf_exempt
 @require_POST
 def challenge_verify(request):
-    client_ip = request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip() or request.META.get("REMOTE_ADDR", "unknown")
+    client_ip = _client_ip(request)
     if not _challenge_limiter.check(client_ip):
         return JsonResponse({"error": "rate_limited", "message": "Too many verification attempts. Please wait and try again."}, status=429)
     secret = settings.CHALLENGE_SECRET
     nonce = request.POST.get("nonce", "")[:MAX_NONCE_LENGTH]
     return_to = request.POST.get("return_to", "/")[:MAX_RETURN_TO_LENGTH]
     fp = request.POST.get("fp", "")[:MAX_FP_LENGTH]
+    pow_value = request.POST.get("pow", "")[:MAX_POW_LENGTH]
 
-    i = nonce.find(".")
-    if i == -1 or not fp or len(fp) < 10:
+    difficulty = getattr(settings, "POW_DIFFICULTY", POW_DIFFICULTY)
+    if not validate_challenge_submission(nonce, fp, pow_value, secret, client_ip, difficulty):
         return JsonResponse({"error": "forbidden", "message": "Challenge verification failed."}, status=403)
-
-    nonce_ts = nonce[:i]
-    nonce_sig = nonce[i + 1:]
-    try:
-        ts = int(nonce_ts)
-    except ValueError:
-        return JsonResponse({"error": "forbidden", "message": "Challenge verification failed."}, status=403)
-
-    if int(time.time() * 1000) - ts > 300000:
-        return JsonResponse({"error": "forbidden", "message": "Challenge expired. Reload the page."}, status=403)
-
-    expected_sig = hmac_sign(f"nonce:{nonce_ts}", secret)
-    if not hmac.compare_digest(nonce_sig, expected_sig):
-        return JsonResponse({"error": "forbidden", "message": "Invalid challenge."}, status=403)
 
     safe_path = return_to if return_to.startswith("/") else "/"
     response = HttpResponseRedirect(safe_path)
     secure_cookie = request.is_secure()
     response.set_cookie(
         COOKIE_NAME,
-        make_cookie(secret),
+        make_cookie(secret, client_ip),
         max_age=COOKIE_MAX_AGE,
         path="/",
         httponly=True,

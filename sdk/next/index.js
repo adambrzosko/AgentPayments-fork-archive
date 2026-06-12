@@ -14,6 +14,7 @@ export function createNextMiddleware(options = {}) {
     env,
     publicPathAllowlist: options.publicPathAllowlist || [],
     minPayment: options.minPayment,
+    powDifficulty: options.powDifficulty,
     upstreamNext: () => NextResponse.next(),
     getClientIp: (request) =>
       request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown',

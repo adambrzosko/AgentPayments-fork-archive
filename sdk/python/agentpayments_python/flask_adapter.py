@@ -1,11 +1,8 @@
-import hmac
-import time
-
 from flask import jsonify, make_response, redirect, request
 
-from .challenge import challenge_html
+from .challenge import POW_DIFFICULTY, challenge_html, make_nonce, validate_challenge_submission
 from .cookies import COOKIE_MAX_AGE, COOKIE_NAME, is_valid_cookie_value, make_cookie
-from .crypto import generate_agent_key, hmac_sign, is_valid_agent_key
+from .crypto import generate_agent_key, is_valid_agent_key
 from .detection import is_browser_from_headers, is_public_path
 from .ratelimit import _challenge_limiter
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
@@ -16,9 +13,14 @@ _constants = _json.loads((_Path(__file__).resolve().parent.parent.parent / "cons
 MAX_NONCE_LENGTH = _constants["MAX_NONCE_LENGTH"]
 MAX_RETURN_TO_LENGTH = _constants["MAX_RETURN_TO_LENGTH"]
 MAX_FP_LENGTH = _constants["MAX_FP_LENGTH"]
+MAX_POW_LENGTH = _constants["MAX_POW_LENGTH"]
 
 
-def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = ""):
+def _client_ip() -> str:
+    return request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "unknown"
+
+
+def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = "", pow_difficulty: int = POW_DIFFICULTY):
     if challenge_secret == "default-secret-change-me":
         import logging
         logger = logging.getLogger("agentpayments")
@@ -71,36 +73,26 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
                 }), 402
             return None
 
+        client_ip = _client_ip()
         cookie_val = request.cookies.get(COOKIE_NAME, "")
-        if is_valid_cookie_value(cookie_val, challenge_secret):
+        if is_valid_cookie_value(cookie_val, challenge_secret, client_ip):
             return None
 
-        nonce_ts = str(int(time.time() * 1000))
-        nonce = f"{nonce_ts}.{hmac_sign(f'nonce:{nonce_ts}', challenge_secret)}"
-        return make_response(challenge_html(request.full_path or request.path, nonce), 200, {"Content-Type": "text/html", "Cache-Control": "no-store"})
+        nonce = make_nonce(challenge_secret, client_ip)
+        return make_response(challenge_html(request.full_path or request.path, nonce, pow_difficulty), 200, {"Content-Type": "text/html", "Cache-Control": "no-store"})
 
     @app.post("/__challenge/verify")
     def _verify():
-        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "unknown"
+        client_ip = _client_ip()
         if not _challenge_limiter.check(client_ip):
             return jsonify({"error": "rate_limited", "message": "Too many verification attempts. Please wait and try again."}), 429
         nonce = request.form.get("nonce", "")[:MAX_NONCE_LENGTH]
         return_to = request.form.get("return_to", "/")[:MAX_RETURN_TO_LENGTH]
         fp = request.form.get("fp", "")[:MAX_FP_LENGTH]
-        i = nonce.find(".")
-        if i == -1 or not fp or len(fp) < 10:
+        pow_value = request.form.get("pow", "")[:MAX_POW_LENGTH]
+        if not validate_challenge_submission(nonce, fp, pow_value, challenge_secret, client_ip, pow_difficulty):
             return jsonify({"error": "forbidden", "message": "Challenge verification failed."}), 403
-        nonce_ts = nonce[:i]
-        nonce_sig = nonce[i + 1:]
-        try:
-            ts = int(nonce_ts)
-        except ValueError:
-            return jsonify({"error": "forbidden", "message": "Challenge verification failed."}), 403
-        if int(time.time() * 1000) - ts > 300000:
-            return jsonify({"error": "forbidden", "message": "Challenge expired."}), 403
-        if not hmac.compare_digest(nonce_sig, hmac_sign(f"nonce:{nonce_ts}", challenge_secret)):
-            return jsonify({"error": "forbidden", "message": "Invalid challenge."}), 403
         safe = return_to if return_to.startswith("/") else "/"
         resp = redirect(safe, code=302)
-        resp.set_cookie(COOKIE_NAME, make_cookie(challenge_secret), max_age=COOKIE_MAX_AGE, path='/', httponly=True, secure=True, samesite='Lax')
+        resp.set_cookie(COOKIE_NAME, make_cookie(challenge_secret, client_ip), max_age=COOKIE_MAX_AGE, path='/', httponly=True, secure=True, samesite='Lax')
         return resp

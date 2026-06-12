@@ -1,16 +1,12 @@
 import asyncio
-import hmac
-import json
-import time
-from urllib.parse import urlencode
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from .challenge import challenge_html
+from .challenge import POW_DIFFICULTY, challenge_html, make_nonce, validate_challenge_submission
 from .cookies import COOKIE_MAX_AGE, COOKIE_NAME, is_valid_cookie_value, make_cookie
-from .crypto import generate_agent_key, hmac_sign, is_valid_agent_key
+from .crypto import generate_agent_key, is_valid_agent_key
 from .detection import is_browser_from_headers, is_public_path
 from .ratelimit import _challenge_limiter
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
@@ -21,10 +17,18 @@ _constants = _json.loads((_Path(__file__).resolve().parent.parent.parent / "cons
 MAX_NONCE_LENGTH = _constants["MAX_NONCE_LENGTH"]
 MAX_RETURN_TO_LENGTH = _constants["MAX_RETURN_TO_LENGTH"]
 MAX_FP_LENGTH = _constants["MAX_FP_LENGTH"]
+MAX_POW_LENGTH = _constants["MAX_POW_LENGTH"]
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
 
 
 class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = ""):
+    def __init__(self, app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = "", pow_difficulty: int = POW_DIFFICULTY):
         super().__init__(app)
         if challenge_secret == "default-secret-change-me":
             import logging
@@ -40,6 +44,7 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
         self.debug = debug
         self.solana_rpc_url = solana_rpc_url or (RPC_DEVNET if debug else RPC_MAINNET)
         self.usdc_mint = usdc_mint or (USDC_MINT_DEVNET if debug else USDC_MINT_MAINNET)
+        self.pow_difficulty = pow_difficulty
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -91,43 +96,29 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
 
             return await call_next(request)
 
+        client_ip = _client_ip(request)
         cookie_val = request.cookies.get(COOKIE_NAME, "")
-        if is_valid_cookie_value(cookie_val, self.challenge_secret):
+        if is_valid_cookie_value(cookie_val, self.challenge_secret, client_ip):
             return await call_next(request)
 
-        nonce_ts = str(int(time.time() * 1000))
-        nonce = f"{nonce_ts}.{hmac_sign(f'nonce:{nonce_ts}', self.challenge_secret)}"
-        return HTMLResponse(challenge_html(str(request.url.path), nonce), headers={"Cache-Control": "no-store"})
+        nonce = make_nonce(self.challenge_secret, client_ip)
+        return HTMLResponse(challenge_html(str(request.url.path), nonce, self.pow_difficulty), headers={"Cache-Control": "no-store"})
 
 
-async def challenge_verify_endpoint(request: Request, challenge_secret: str):
-    client_ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-                 or request.client.host if request.client else "unknown")
+async def challenge_verify_endpoint(request: Request, challenge_secret: str, pow_difficulty: int = POW_DIFFICULTY):
+    client_ip = _client_ip(request)
     if not _challenge_limiter.check(client_ip):
         return JSONResponse({"error": "rate_limited", "message": "Too many verification attempts. Please wait and try again."}, status_code=429)
     form = await request.form()
     nonce = str(form.get("nonce", ""))[:MAX_NONCE_LENGTH]
     return_to = str(form.get("return_to", "/"))[:MAX_RETURN_TO_LENGTH]
     fp = str(form.get("fp", ""))[:MAX_FP_LENGTH]
+    pow_value = str(form.get("pow", ""))[:MAX_POW_LENGTH]
 
-    i = nonce.find(".")
-    if i == -1 or not fp or len(fp) < 10:
+    if not validate_challenge_submission(nonce, fp, pow_value, challenge_secret, client_ip, pow_difficulty):
         return JSONResponse({"error": "forbidden", "message": "Challenge verification failed."}, status_code=403)
-
-    nonce_ts = nonce[:i]
-    nonce_sig = nonce[i + 1:]
-    try:
-        ts = int(nonce_ts)
-    except ValueError:
-        return JSONResponse({"error": "forbidden", "message": "Challenge verification failed."}, status_code=403)
-
-    if int(time.time() * 1000) - ts > 300000:
-        return JSONResponse({"error": "forbidden", "message": "Challenge expired."}, status_code=403)
-
-    if not hmac.compare_digest(nonce_sig, hmac_sign(f"nonce:{nonce_ts}", challenge_secret)):
-        return JSONResponse({"error": "forbidden", "message": "Invalid challenge."}, status_code=403)
 
     safe_path = return_to if return_to.startswith("/") else "/"
     resp = RedirectResponse(url=safe_path, status_code=302)
-    resp.set_cookie(COOKIE_NAME, make_cookie(challenge_secret), max_age=COOKIE_MAX_AGE, path="/", httponly=True, secure=True, samesite="lax")
+    resp.set_cookie(COOKIE_NAME, make_cookie(challenge_secret, client_ip), max_age=COOKIE_MAX_AGE, path="/", httponly=True, secure=True, samesite="lax")
     return resp

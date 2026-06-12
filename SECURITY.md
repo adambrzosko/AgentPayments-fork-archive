@@ -10,8 +10,11 @@ AgentPayments sits at the edge of a web application and decides whether to allow
 |---|---|---|
 | **Timing attacks on HMAC** | Attacker infers valid signatures byte-by-byte | Timing-safe comparison in all SDKs |
 | **Agent key forgery** | Attacker crafts a key that passes validation without paying | HMAC-SHA256 signing; keys are `ag_<random>_<hmac>` |
-| **Cookie forgery** | Attacker crafts a verification cookie to bypass the challenge | HMAC-signed timestamp cookies with expiry |
-| **Nonce replay** | Attacker reuses a captured challenge nonce | 5-minute nonce expiry + HMAC signature |
+| **Cookie forgery** | Attacker crafts a verification cookie to bypass the challenge | HMAC-signed timestamp cookies with expiry, bound to client IP |
+| **Cookie sharing/theft** | One solved challenge feeds a fleet of scrapers | Cookie HMAC includes client IP hash — invalid from any other IP |
+| **Nonce replay** | Attacker reuses a captured challenge nonce | 5-minute expiry + IP-bound HMAC + single-use tracking |
+| **Bulk cookie minting** | Scripted client solves challenges at scale | SHA-256 proof-of-work (~16^4 hashes per cookie, configurable) |
+| **Faked browser headers** | Scraper sends `Sec-Fetch-*` headers to reach the challenge | Challenge requires proof-of-work + server-validated fingerprint, not just headers |
 | **Challenge endpoint abuse** | Attacker brute-forces verification to extract cookies | Rate limiting (20 req/min/IP) |
 | **Oversized input injection** | Attacker sends huge payloads to cause memory issues | Input size limits on all user-supplied fields |
 | **Invalid wallet address** | Misconfigured wallet causes silent payment failures | Base58 validation at init time |
@@ -48,6 +51,19 @@ ag_<16-char-random>_<16-char-hmac>
 - The HMAC is `hmacSign(random, CHALLENGE_SECRET)` truncated to 16 hex chars.
 - Max key length: 64 characters.
 
+### Client Binding
+
+A short client identifier binds nonces and cookies to the requester:
+
+```
+client_id = hmacSign("client:<ip>", CHALLENGE_SECRET)[:16]
+```
+
+A cookie or nonce captured by another machine fails validation because the
+verifying request's IP produces a different `client_id`. Trade-off: clients
+whose IP changes mid-session (e.g. mobile network handoff) re-solve the
+challenge.
+
 ### Cookie Format
 
 ```
@@ -55,7 +71,7 @@ ag_<16-char-random>_<16-char-hmac>
 ```
 
 - Timestamp is `Date.now()` at cookie creation.
-- HMAC is `hmacSign(timestamp, CHALLENGE_SECRET)`.
+- HMAC is `hmacSign("cookie:<timestamp>:<client_id>", CHALLENGE_SECRET)`.
 - Cookie name: `__agp_verified`.
 - Max age: 86400 seconds (24 hours).
 - Flags: `HttpOnly`, `Secure`, `SameSite=Lax`.
@@ -63,12 +79,37 @@ ag_<16-char-random>_<16-char-hmac>
 ### Nonce Format
 
 ```
-<timestamp>.<hmac>
+<timestamp>.<random>.<hmac>
 ```
 
-- Timestamp is `Date.now()` at nonce creation.
-- HMAC is `hmacSign("nonce:<timestamp>", CHALLENGE_SECRET)`.
+- Timestamp is `Date.now()` at nonce creation; random is 16 hex chars.
+- HMAC is `hmacSign("nonce:<timestamp>:<random>:<client_id>", CHALLENGE_SECRET)`.
 - Expires after 5 minutes (300,000 ms).
+- Single-use: consumed nonces are tracked in memory and rejected on replay.
+  (Best-effort on multi-instance/edge deployments until a shared state
+  backend lands — see ROADMAP.)
+
+### Proof-of-Work
+
+The challenge page must find a decimal counter `pow` such that:
+
+```
+sha256("<nonce>:<pow>") starts with "0" * POW_DIFFICULTY   (default: 4 hex chars)
+```
+
+Verification costs the server one hash; solving costs ~16^difficulty hashes
+(~65k at the default, sub-second in a real browser via Web Crypto). This makes
+bulk cookie minting computationally expensive while staying invisible to
+legitimate visitors. Configurable per SDK: `powDifficulty` (Node/Edge/Next),
+`pow_difficulty` (FastAPI/Flask), `POW_DIFFICULTY` Django setting.
+
+### Fingerprint Validation
+
+The submitted canvas fingerprint must be base64 (`[A-Za-z0-9+/]`, ≥10 chars)
+with at least 4 distinct characters. This is a plausibility filter, not proof
+of a real browser — the proof-of-work and client binding carry the security
+weight. Client-side checks (`navigator.webdriver`, canvas render, viewport
+size) are friction for naive bots, not a security boundary.
 
 ## Input Validation
 
@@ -117,9 +158,13 @@ The challenge page served to browser visitors:
 1. Checks `navigator.webdriver` (rejects headless browsers).
 2. Renders a canvas fingerprint to detect non-browser environments.
 3. Validates `window.innerWidth` is non-zero (screens have dimensions).
-4. Submits nonce + fingerprint + return URL via hidden form POST.
-5. Includes `<noscript>` fallback for JavaScript-disabled users.
-6. Uses `role="status"` and `aria-live="polite"` for accessibility.
+4. Solves the SHA-256 proof-of-work over the nonce via Web Crypto.
+5. Submits nonce + fingerprint + proof-of-work + return URL via hidden form POST.
+6. Includes `<noscript>` fallback for JavaScript-disabled users.
+7. Uses `role="status"` and `aria-live="polite"` for accessibility.
+
+Note: the challenge requires a secure context (HTTPS or localhost) because it
+uses `crypto.subtle`.
 
 ## Responsible Disclosure
 
