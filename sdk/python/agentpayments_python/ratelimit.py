@@ -36,3 +36,5 @@ class RateLimiter:
 
 
 _challenge_limiter = RateLimiter()
+# Stricter limit for the agent-key payment verification path.
+_agent_key_limiter = RateLimiter(max_hits=10)

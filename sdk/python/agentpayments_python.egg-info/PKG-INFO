@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: agentpayments-python
+Version: 0.1.0
+Summary: AgentPayments middleware/adapters for Python web frameworks
+Requires-Python: >=3.10
+Requires-Dist: requests>=2.31
+Provides-Extra: django
+Requires-Dist: Django>=5.0; extra == "django"
+Provides-Extra: fastapi
+Requires-Dist: fastapi>=0.110; extra == "fastapi"
+Requires-Dist: starlette>=0.37; extra == "fastapi"
+Provides-Extra: flask
+Requires-Dist: flask>=3.0; extra == "flask"

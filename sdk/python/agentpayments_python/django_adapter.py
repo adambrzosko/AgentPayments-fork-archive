@@ -9,7 +9,8 @@ from .challenge import POW_DIFFICULTY, challenge_html, make_nonce, validate_chal
 from .cookies import COOKIE_MAX_AGE, COOKIE_NAME, is_valid_cookie_value, make_cookie
 from .crypto import generate_agent_key, is_valid_agent_key
 from .detection import is_browser_from_headers, is_public_path
-from .ratelimit import _challenge_limiter
+from .ratelimit import _challenge_limiter, _agent_key_limiter
+from .crawler import is_verified_crawler
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
 
 import json as _json
@@ -52,6 +53,10 @@ class GateMiddleware:
         self.usdc_mint = usdc_mint
         self.network = "devnet" if debug else "mainnet-beta"
         self.pow_difficulty = getattr(settings, "POW_DIFFICULTY", POW_DIFFICULTY)
+        self.verify_crawlers = getattr(settings, "AGENTPAYMENTS_VERIFY_CRAWLERS", True)
+        # Optional grant store for durable paid-key persistence. Set
+        # AGENTPAYMENTS_GRANT_STORE to a GrantStore instance in settings.py.
+        self.grant_store = getattr(settings, "AGENTPAYMENTS_GRANT_STORE", None)
 
     def __call__(self, request):
         secret = self.secret
@@ -64,6 +69,13 @@ class GateMiddleware:
 
         if pathname == "/__challenge/verify" and request.method == "POST":
             return self.get_response(request)
+
+        # Verified search crawlers bypass the gate entirely.
+        if self.verify_crawlers:
+            client_ip_early = _client_ip(request)
+            ua = request.META.get("HTTP_USER_AGENT", "")
+            if is_verified_crawler(client_ip_early, ua):
+                return self.get_response(request)
 
         headers = {
             "sec-fetch-mode": request.META.get("HTTP_SEC_FETCH_MODE"),
@@ -91,10 +103,19 @@ class GateMiddleware:
             if not is_valid_agent_key(agent_key, secret):
                 return JsonResponse({"error": "forbidden", "message": "Invalid API key. Keys must be issued by this server."}, status=403)
 
+            if not _agent_key_limiter.check(_client_ip(request)):
+                return JsonResponse({"error": "rate_limited", "message": "Too many payment verification requests. Please wait and try again."}, status=429)
+
             if not wallet_address:
                 return JsonResponse({"error": "server_error", "message": "Payment verification unavailable."}, status=500)
 
+            # Durable grant check — bypasses RPC scan entirely for known-paid keys.
+            if self.grant_store and self.grant_store.has(agent_key):
+                return self.get_response(request)
+
             paid = verify_payment_on_chain(agent_key, wallet_address, self.rpc_url, self.usdc_mint)
+            if paid and self.grant_store:
+                self.grant_store.add(agent_key)
             if not paid:
                 return JsonResponse({
                     "error": "payment_required",

@@ -8,7 +8,8 @@ from .challenge import POW_DIFFICULTY, challenge_html, make_nonce, validate_chal
 from .cookies import COOKIE_MAX_AGE, COOKIE_NAME, is_valid_cookie_value, make_cookie
 from .crypto import generate_agent_key, is_valid_agent_key
 from .detection import is_browser_from_headers, is_public_path
-from .ratelimit import _challenge_limiter
+from .ratelimit import _challenge_limiter, _agent_key_limiter
+from .crawler import is_verified_crawler
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
 
 import json as _json
@@ -28,7 +29,7 @@ def _client_ip(request: Request) -> str:
 
 
 class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = "", pow_difficulty: int = POW_DIFFICULTY):
+    def __init__(self, app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = "", pow_difficulty: int = POW_DIFFICULTY, verify_crawlers: bool = True, grant_store=None):
         super().__init__(app)
         if challenge_secret == "default-secret-change-me":
             import logging
@@ -45,6 +46,8 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
         self.solana_rpc_url = solana_rpc_url or (RPC_DEVNET if debug else RPC_MAINNET)
         self.usdc_mint = usdc_mint or (USDC_MINT_DEVNET if debug else USDC_MINT_MAINNET)
         self.pow_difficulty = pow_difficulty
+        self.verify_crawlers = verify_crawlers
+        self.grant_store = grant_store
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -53,6 +56,15 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
 
         if path == "/__challenge/verify" and request.method == "POST":
             return await call_next(request)
+
+        # Verified search crawlers bypass the gate entirely.
+        # is_verified_crawler is blocking I/O — run in executor to avoid blocking the event loop.
+        if self.verify_crawlers:
+            client_ip_early = _client_ip(request)
+            ua = request.headers.get("user-agent", "")
+            loop = asyncio.get_event_loop()
+            if await loop.run_in_executor(None, is_verified_crawler, client_ip_early, ua):
+                return await call_next(request)
 
         if not is_browser_from_headers(dict(request.headers)):
             agent_key = request.headers.get("x-agent-key")
@@ -77,8 +89,15 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
             if not is_valid_agent_key(agent_key, self.challenge_secret):
                 return JSONResponse({"error": "forbidden", "message": "Invalid API key."}, status_code=403)
 
+            if not _agent_key_limiter.check(_client_ip(request)):
+                return JSONResponse({"error": "rate_limited", "message": "Too many payment verification requests. Please wait and try again."}, status_code=429)
+
             if not self.home_wallet_address:
                 return JSONResponse({"error": "server_error", "message": "Payment verification unavailable."}, status_code=500)
+
+            # Durable grant check — bypasses RPC scan entirely for known-paid keys.
+            if self.grant_store and self.grant_store.has(agent_key):
+                return await call_next(request)
 
             # verify_payment_on_chain is synchronous (uses requests). Run it in a
             # thread-pool executor so it doesn't block the async event loop.
@@ -86,6 +105,8 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
             paid = await loop.run_in_executor(
                 None, verify_payment_on_chain, agent_key, self.home_wallet_address, self.solana_rpc_url, self.usdc_mint
             )
+            if paid and self.grant_store:
+                self.grant_store.add(agent_key)
             if not paid:
                 return JSONResponse({
                     "error": "payment_required",

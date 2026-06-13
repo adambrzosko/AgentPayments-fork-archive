@@ -4,7 +4,8 @@ from .challenge import POW_DIFFICULTY, challenge_html, make_nonce, validate_chal
 from .cookies import COOKIE_MAX_AGE, COOKIE_NAME, is_valid_cookie_value, make_cookie
 from .crypto import generate_agent_key, is_valid_agent_key
 from .detection import is_browser_from_headers, is_public_path
-from .ratelimit import _challenge_limiter
+from .ratelimit import _challenge_limiter, _agent_key_limiter
+from .crawler import is_verified_crawler
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
 
 import json as _json
@@ -20,7 +21,7 @@ def _client_ip() -> str:
     return request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "unknown"
 
 
-def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = "", pow_difficulty: int = POW_DIFFICULTY):
+def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: str, debug: bool = True, solana_rpc_url: str = "", usdc_mint: str = "", pow_difficulty: int = POW_DIFFICULTY, verify_crawlers: bool = True, grant_store=None):
     if challenge_secret == "default-secret-change-me":
         import logging
         logger = logging.getLogger("agentpayments")
@@ -40,6 +41,12 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
             return None
         if path == "/__challenge/verify" and request.method == "POST":
             return None
+
+        # Verified search crawlers bypass the gate entirely.
+        if verify_crawlers:
+            ua = request.headers.get("User-Agent", "")
+            if is_verified_crawler(_client_ip(), ua):
+                return None
 
         if not is_browser_from_headers(request.headers):
             key = request.headers.get("X-Agent-Key")
@@ -62,9 +69,16 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
                 }), 402
             if not is_valid_agent_key(key, challenge_secret):
                 return jsonify({"error": "forbidden", "message": "Invalid API key."}), 403
+            if not _agent_key_limiter.check(_client_ip()):
+                return jsonify({"error": "rate_limited", "message": "Too many payment verification requests. Please wait and try again."}), 429
             if not home_wallet_address:
                 return jsonify({"error": "server_error", "message": "Payment verification unavailable."}), 500
-            if not verify_payment_on_chain(key, home_wallet_address, rpc_url, mint):
+            if grant_store and grant_store.has(key):
+                return None
+            paid = verify_payment_on_chain(key, home_wallet_address, rpc_url, mint)
+            if paid and grant_store:
+                grant_store.add(key)
+            if not paid:
                 return jsonify({
                     "error": "payment_required",
                     "message": "Key is valid but payment has not been verified on-chain yet.",

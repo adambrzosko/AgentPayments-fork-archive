@@ -10,32 +10,37 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-PAYMENT_CACHE_TTL = 10 * 60  # 10 minutes in seconds
+PAYMENT_CACHE_TTL = 10 * 60      # 10 minutes in seconds
+NEGATIVE_CACHE_TTL = 30          # 30 seconds for negative results
 PAYMENT_CACHE_MAX = 1000
 
 
 class _PaymentCache:
-    def __init__(self, ttl: int = PAYMENT_CACHE_TTL, max_size: int = PAYMENT_CACHE_MAX):
-        self.ttl = ttl
+    """Caches both positive (True) and negative (False) payment results with per-entry TTLs."""
+
+    def __init__(self, max_size: int = PAYMENT_CACHE_MAX):
         self.max_size = max_size
-        self._cache: OrderedDict[str, float] = OrderedDict()
+        # stores (value: bool, ts: float, ttl: int)
+        self._cache: OrderedDict[str, tuple[bool, float, int]] = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, key: str) -> bool:
+    def get(self, key: str):
+        """Returns True, False, or None (not cached / expired)."""
         with self._lock:
-            ts = self._cache.get(key)
-            if ts is None:
-                return False
-            if _time.time() - ts > self.ttl:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            value, ts, ttl = entry
+            if _time.time() - ts > ttl:
                 del self._cache[key]
-                return False
-            return True
+                return None
+            return value
 
-    def set(self, key: str) -> None:
+    def set(self, key: str, value: bool, ttl: int) -> None:
         with self._lock:
             if len(self._cache) >= self.max_size:
                 self._cache.popitem(last=False)
-            self._cache[key] = _time.time()
+            self._cache[key] = (value, _time.time(), ttl)
 
 
 _payment_cache = _PaymentCache()
@@ -49,6 +54,7 @@ RPC_DEVNET = _constants["RPC_DEVNET"]
 RPC_MAINNET = _constants["RPC_MAINNET"]
 MEMO_PROGRAM = _constants["MEMO_PROGRAM"]
 MIN_PAYMENT = _constants["MIN_PAYMENT"]
+MAX_TRANSACTIONS_PER_VERIFY = _constants["MAX_TRANSACTIONS_PER_VERIFY"]
 
 
 def _rpc_call(rpc_url: str, method: str, params: list, retries: int = 2, backoff: float = 0.3) -> dict:
@@ -77,8 +83,11 @@ def is_valid_solana_address(address: str) -> bool:
 
 
 def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, usdc_mint: str) -> bool:
-    if _payment_cache.get(agent_key):
+    cached = _payment_cache.get(agent_key)
+    if cached is True:
         return True
+    if cached is False:
+        return False  # negative cached — skip RPC until TTL expires
     if not is_valid_solana_address(wallet_address):
         logger.error("[gate] Invalid wallet address: %s", wallet_address)
         return False
@@ -103,9 +112,14 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
                     seen.add(sig["signature"])
                     all_signatures.append(sig)
 
+        tx_call_count = 0
         for sig_info in all_signatures:
+            if tx_call_count >= MAX_TRANSACTIONS_PER_VERIFY:
+                logger.warning("[gate] getTransaction cap reached (key=%s..., cap=%d)", agent_key[:12], MAX_TRANSACTIONS_PER_VERIFY)
+                break
             if sig_info.get("err"):
                 continue
+            tx_call_count += 1
 
             tx_data = _rpc_call(rpc_url, "getTransaction", [sig_info["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
             tx = tx_data.get("result")
@@ -148,9 +162,10 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
                             has_payment = True
 
             if has_memo and has_payment:
-                _payment_cache.set(agent_key)
+                _payment_cache.set(agent_key, True, PAYMENT_CACHE_TTL)
                 return True
     except Exception:
         logger.exception("[gate] Solana RPC error")
 
+    _payment_cache.set(agent_key, False, NEGATIVE_CACHE_TTL)
     return False

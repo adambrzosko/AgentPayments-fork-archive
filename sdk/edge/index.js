@@ -19,22 +19,62 @@ const MAX_FP_LENGTH = 128;
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const PAYMENT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 const PAYMENT_CACHE_MAX = 1000;
+const NEGATIVE_CACHE_TTL_MS = 30000; // 30 seconds
+const MAX_TRANSACTIONS_PER_VERIFY = 20;
+const AGENT_KEY_RATE_LIMIT_MAX = 10;
 
-const paymentCache = new Map();
+// ---------------------------------------------------------------------------
+// Pluggable async store interface
+//
+// Any object implementing all four methods can be passed as the `store`
+// option to createEdgeGate, or returned by the `getStore` factory.
+//
+// interface Store {
+//   consumeNonce(sig: string, ttlMs: number): Promise<boolean>     // true = fresh
+//   checkRateLimit(key: string, windowMs: number, max: number): Promise<boolean>
+//   getCachedPayment(agentKey: string): Promise<boolean | undefined>
+//   setCachedPayment(agentKey: string, value: boolean, ttlMs: number): Promise<void>
+// }
+// ---------------------------------------------------------------------------
 
-function getCachedPayment(key) {
-  const entry = paymentCache.get(key);
-  if (!entry) return undefined;
-  if (Date.now() - entry.ts > PAYMENT_CACHE_TTL) { paymentCache.delete(key); return undefined; }
-  return entry.value;
-}
-
-function setCachedPayment(key, value) {
-  if (paymentCache.size >= PAYMENT_CACHE_MAX) {
-    const oldest = paymentCache.keys().next().value;
-    paymentCache.delete(oldest);
+export class InMemoryStore {
+  constructor() {
+    this._nonces   = new Map(); // sig -> expiryMs
+    this._rateLimit = new Map(); // key -> {start, count}
+    this._payments  = new Map(); // agentKey -> {value, ts}
   }
-  paymentCache.set(key, { value, ts: Date.now() });
+
+  async consumeNonce(sig, ttlMs) {
+    const now = Date.now();
+    const exp = this._nonces.get(sig);
+    if (exp !== undefined && exp > now) return false; // already used
+    if (this._nonces.size >= 10000) this._nonces.delete(this._nonces.keys().next().value);
+    this._nonces.set(sig, now + ttlMs);
+    return true;
+  }
+
+  async checkRateLimit(key, windowMs, max) {
+    const now = Date.now();
+    const entry = this._rateLimit.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      this._rateLimit.set(key, { start: now, count: 1 });
+      return true;
+    }
+    entry.count++;
+    return entry.count <= max;
+  }
+
+  async getCachedPayment(agentKey) {
+    const entry = this._payments.get(agentKey);
+    if (!entry) return undefined;
+    if (Date.now() - entry.ts > entry.ttl) { this._payments.delete(agentKey); return undefined; }
+    return entry.value;
+  }
+
+  async setCachedPayment(agentKey, value, ttlMs) {
+    if (this._payments.size >= PAYMENT_CACHE_MAX) this._payments.delete(this._payments.keys().next().value);
+    this._payments.set(agentKey, { value, ts: Date.now(), ttl: ttlMs });
+  }
 }
 
 function gateLog(level, message, data = {}) {
@@ -46,17 +86,54 @@ function gateLog(level, message, data = {}) {
 
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 20;
-const rateLimitHits = new Map();
 
-function rateLimitCheck(key) {
-  const now = Date.now();
-  const entry = rateLimitHits.get(key);
-  if (!entry || now - entry.start > RATE_LIMIT_WINDOW) {
-    rateLimitHits.set(key, { start: now, count: 1 });
-    return true;
-  }
-  entry.count++;
-  return entry.count <= RATE_LIMIT_MAX;
+// ---------------------------------------------------------------------------
+// Verified crawler allowlist (DNS-over-HTTPS for edge environments)
+// ---------------------------------------------------------------------------
+const CRAWLER_PATTERNS = [
+  { pattern: /googlebot/i,              suffix: '.googlebot.com' },
+  { pattern: /google-inspectiontool/i,  suffix: '.google.com' },
+  { pattern: /bingbot/i,                suffix: '.search.msn.com' },
+  { pattern: /slurp/i,                  suffix: '.crawl.yahoo.net' },
+  { pattern: /duckduckbot/i,            suffix: '.duckduckgo.com' },
+  { pattern: /baiduspider/i,            suffix: '.crawl.baidu.com' },
+  { pattern: /yandexbot/i,              suffix: '.yandex.com' },
+  { pattern: /applebot/i,               suffix: '.applebot.apple.com' },
+];
+const CRAWLER_CACHE_TTL = 60 * 60 * 1000; // 1 hour, per-isolate
+const _crawlerCache = new Map(); // ip -> { verified: boolean, exp: number }
+
+async function isVerifiedCrawler(ip, userAgent) {
+  if (!userAgent || !ip || ip === 'unknown') return false;
+  const match = CRAWLER_PATTERNS.find((c) => c.pattern.test(userAgent));
+  if (!match) return false;
+
+  const cached = _crawlerCache.get(ip);
+  if (cached && cached.exp > Date.now()) return cached.verified;
+
+  let verified = false;
+  try {
+    // Reverse lookup: convert IP to PTR name (IPv4 only for now).
+    const reversed = ip.split('.').reverse().join('.');
+    const ptrResp = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${reversed}.in-addr.arpa&type=PTR`,
+      { headers: { Accept: 'application/dns-json' } },
+    );
+    const ptrData = await ptrResp.json();
+    const hostname = (ptrData.Answer?.[0]?.data || '').replace(/\.$/, '');
+    if (hostname && hostname.endsWith(match.suffix)) {
+      // Forward verify: hostname must resolve back to the original IP.
+      const aResp = await fetch(
+        `https://cloudflare-dns.com/dns-query?name=${hostname}&type=A`,
+        { headers: { Accept: 'application/dns-json' } },
+      );
+      const aData = await aResp.json();
+      verified = (aData.Answer || []).some((r) => r.data === ip);
+    }
+  } catch { /* DNS failure = not verified */ }
+
+  _crawlerCache.set(ip, { verified, exp: Date.now() + CRAWLER_CACHE_TTL });
+  return verified;
 }
 
 // Cache derived CryptoKey objects by secret so importKey isn't called on every
@@ -124,23 +201,6 @@ async function verifyPow(nonce, pow, difficulty) {
   return (await sha256Hex(`${nonce}:${pow}`)).startsWith('0'.repeat(difficulty));
 }
 
-// Single-use nonce tracking. Per-isolate on edge runtimes, so best-effort —
-// a durable backend (KV/DO) is required for a hard guarantee across isolates.
-const consumedNonces = new Map();
-const CONSUMED_NONCES_MAX = 10000;
-
-function consumeNonce(sig) {
-  const now = Date.now();
-  const exp = consumedNonces.get(sig);
-  if (exp !== undefined && exp > now) return false;
-  if (consumedNonces.size >= CONSUMED_NONCES_MAX) {
-    const oldest = consumedNonces.keys().next().value;
-    consumedNonces.delete(oldest);
-  }
-  consumedNonces.set(sig, now + NONCE_TTL_MS);
-  return true;
-}
-
 async function generateAgentKey(secret) {
   const random = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
   const sig = await hmacSign(random, secret);
@@ -204,8 +264,14 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint) {
       }
     }
 
+    let txCallCount = 0;
     for (const sigInfo of allSignatures) {
+      if (txCallCount >= MAX_TRANSACTIONS_PER_VERIFY) {
+        gateLog('warn', 'getTransaction cap reached', { key: agentKey.slice(0, 12) + '...', cap: MAX_TRANSACTIONS_PER_VERIFY });
+        break;
+      }
       if (sigInfo.err) continue;
+      txCallCount++;
 
       const txData = await rpcCall(rpcUrl, 'getTransaction', [sigInfo.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
       const tx = txData.result;
@@ -274,8 +340,13 @@ function isPublicPath(pathname, allowlist = []) {
   return false;
 }
 
+const BROWSER_UA_RE = /(Chrome|Chromium|Firefox|Safari|Edg|OPR|Opera|SamsungBrowser|UCBrowser|Mobile Safari)/i;
+const BOT_UA_RE = /bot|crawl|spider|slurp|mediapartners|adsbot/i;
+
 function isBrowser(request) {
-  return Boolean(request.headers.get('sec-fetch-mode') || request.headers.get('sec-fetch-dest'));
+  if (request.headers.get('sec-fetch-mode') || request.headers.get('sec-fetch-dest')) return true;
+  const ua = request.headers.get('user-agent') || '';
+  return Boolean(ua && !BOT_UA_RE.test(ua) && BROWSER_UA_RE.test(ua));
 }
 
 function jsonResponse(body, status) {
@@ -300,13 +371,25 @@ export function createEdgeGate(options = {}) {
     minPayment = MIN_PAYMENT,
     powDifficulty = POW_DIFFICULTY,
     envResolver,
+    // Pluggable state backend. Provide one of:
+    //   store    — a static Store instance (shared across all requests)
+    //   getStore — factory ({ request, env, context }) => Store (use for KV,
+    //              where env holds the binding resolved per-request)
+    store: staticStore,
+    getStore,
+    // When true (default), verified search crawlers bypass the gate entirely.
+    verifyCrawlers = true,
   } = options;
 
   if (typeof fetchUpstream !== 'function') {
     throw new Error('createEdgeGate requires fetchUpstream(request, env, context)');
   }
 
+  // Default in-memory store shared across requests within this isolate.
+  const _defaultStore = new InMemoryStore();
+
   return async function edgeGate(request, env = {}, context = {}) {
+    const store = getStore ? getStore({ request, env, context }) : (staticStore || _defaultStore);
     const effectiveEnv = envResolver ? await envResolver({ request, env, context }) : env;
     const url = new URL(request.url);
     const secret = effectiveEnv.CHALLENGE_SECRET || 'default-secret-change-me';
@@ -330,9 +413,16 @@ export function createEdgeGate(options = {}) {
       return fetchUpstream(request, effectiveEnv, context);
     }
 
+    // Verified search crawlers bypass the gate (no challenge, no payment).
+    if (verifyCrawlers) {
+      const crawlerIp = getClientIp({ request, env: effectiveEnv, context });
+      const ua = request.headers.get('user-agent') || '';
+      if (await isVerifiedCrawler(crawlerIp, ua)) return fetchUpstream(request, effectiveEnv, context);
+    }
+
     if (url.pathname === '/__challenge/verify' && request.method === 'POST') {
       const clientIp = getClientIp({ request, env: effectiveEnv, context });
-      if (!rateLimitCheck(clientIp)) {
+      if (!(await store.checkRateLimit(clientIp, RATE_LIMIT_WINDOW, RATE_LIMIT_MAX))) {
         return jsonResponse({ error: 'rate_limited', message: 'Too many verification attempts. Please wait and try again.' }, 429);
       }
       const formData = await request.formData();
@@ -363,8 +453,8 @@ export function createEdgeGate(options = {}) {
         return jsonResponse({ error: 'forbidden', message: 'Challenge verification failed.' }, 403);
       }
 
-      // Single use: a solved nonce cannot mint a second cookie (per-isolate, best-effort).
-      if (!consumeNonce(nonceSig)) {
+      // Single use: a solved nonce cannot mint a second cookie.
+      if (!(await store.consumeNonce(nonceSig, NONCE_TTL_MS))) {
         return jsonResponse({ error: 'forbidden', message: 'Challenge expired. Reload the page.' }, 403);
       }
 
@@ -410,15 +500,29 @@ export function createEdgeGate(options = {}) {
         }, 403);
       }
 
+      // Rate-limit the verification path (stricter than the challenge endpoint).
+      const agentKeyIp = getClientIp({ request, env: effectiveEnv, context });
+      if (!(await store.checkRateLimit(`ak:${agentKeyIp}`, RATE_LIMIT_WINDOW, AGENT_KEY_RATE_LIMIT_MAX))) {
+        return jsonResponse({ error: 'rate_limited', message: 'Too many payment verification requests. Please wait and try again.' }, 429);
+      }
+
       if (!walletAddress) {
         return jsonResponse({ error: 'server_error', message: 'Payment verification unavailable.' }, 500);
       }
 
-      if (getCachedPayment(agentKey) === true) {
-        return fetchUpstream(request, effectiveEnv, context);
+      const cachedPayment = await store.getCachedPayment(agentKey);
+      if (cachedPayment === true) return fetchUpstream(request, effectiveEnv, context);
+      if (cachedPayment === false) {
+        // Negative result cached — skip the RPC scan until the TTL expires.
+        return jsonResponse({
+          error: 'payment_required',
+          message: 'Key is valid but payment has not been verified on-chain yet. Please send the USDC payment and allow a few moments for confirmation.',
+          your_key: agentKey,
+          payment: { chain: 'solana', network: debug ? 'devnet' : 'mainnet-beta', token: 'USDC', amount: String(minPayment), wallet_address: walletAddress, memo: agentKey },
+        }, 402);
       }
       const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint);
-      if (paid) setCachedPayment(agentKey, true);
+      await store.setCachedPayment(agentKey, paid, paid ? PAYMENT_CACHE_TTL : NEGATIVE_CACHE_TTL_MS);
       if (!paid) {
         return jsonResponse({
           error: 'payment_required',

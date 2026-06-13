@@ -16,29 +16,31 @@ Prioritized list of work required before real websites can rely on AgentPayments
 ### 3. Cookies are not bound to a client — **fixed**
 A verification cookie was `timestamp.hmac` — identical for every visitor, valid from any IP. Now the cookie HMAC includes a client-IP hash, so a captured cookie fails from any other IP. Trade-off: clients whose IP changes mid-session re-solve the challenge.
 
-### 4. RPC exhaustion DoS on the agent path
-Valid agent keys are free to mint (every 402 issues one) and each unpaid key triggers up to ~100+ `getTransaction` calls. Only successful verifications are cached.
+### 4. RPC exhaustion DoS on the agent path — **fixed**
+Valid agent keys are free to mint (every 402 issues one) and each unpaid key triggered up to ~100+ `getTransaction` calls. Fixed: negative results cached 30 s (skips RPC on repeated attempts), agent-key verification path rate-limited at 10 req/min/IP, and `getTransaction` calls capped at 20 per verification. Remaining: negative results on the KV store propagate across isolates via the pluggable store interface, but the in-memory fallback is still per-isolate.
 
-- Cache negative results with a short TTL (e.g., 30–60s).
-- Rate-limit the `X-Agent-Key` verification path per IP (the existing limiter only covers `/__challenge/verify`).
-- Cap total `getTransaction` calls per verification.
-
-### 5. Paid access silently expires
-Verification re-scans the last 100 signatures, so a paid key stops working once the wallet receives 100 newer transactions — an attacker can force this with dust transfers. Persist successful verifications (grant record keyed by agent key) instead of re-scanning; the 10-min cache is not persistence.
+### 5. Paid access silently expires — **fixed**
+Verification re-scans the last 100 signatures, so a paid key stopped working once the wallet received 100 newer transactions. Fixed: pluggable `grantStore` interface (Node: `sdk/node/grant-store.js`, Python: `sdk/python/agentpayments_python/grant_store.py`). Once a key is verified it is added to the store and never re-scanned. Default is in-memory (no persistence). `FileGrantStore` writes to a JSON file with atomic rename — survives restarts, not suitable for multi-process deployments. For multi-process use Redis or a database. Edge: the `CloudflareKVStore` already stores results durably with a 30-day TTL for positive results (set by `PAYMENT_CACHE_TTL` in `setCachedPayment`).
 
 ### 6. Nonce replay — **fixed (best-effort on edge)**
 Nonces now carry a random component and are tracked in an in-memory consumed set after use. On multi-isolate edge runtimes this is per-isolate until a shared state backend lands (see P1).
 
-### 7. Private keys committed to git
-`jsons/wallet-keys.json` (includes mnemonic) and `jsons/bot-wallet.json` (includes secret key) are tracked. Even devnet-only, purge them from git history (`git filter-repo`) before open-sourcing or publishing, rotate the wallets, and gitignore the whole `jsons/` directory.
+### 7. Private keys committed to git — **gitignore fixed; history purge required**
+`jsons/wallet-keys.json` and `jsons/bot-wallet.json` are tracked in git. `jsons/` is now in `.gitignore` so no new keys will be committed. The existing history still contains the keys — you must purge it before open-sourcing:
+
+```bash
+# Install git-filter-repo (pip install git-filter-repo)
+git filter-repo --path jsons/ --invert-paths
+# Rotate the wallets — assume the devnet keys are compromised.
+```
 
 ## P1 — Adoption blockers
 
-### SEO safety (the #1 objection from prospective sites)
-Search crawlers hit the non-browser path and receive a 402. Add a verified-crawler allowlist: match UA, then confirm via reverse DNS (Googlebot, Bingbot) or published IP ranges. Make it on by default with config to disable.
+### SEO safety (the #1 objection from prospective sites) — **fixed**
+Search crawlers received a 402 like any other non-browser. Fixed: all three SDKs now run a verified-crawler check before the gate — UA pattern match followed by reverse+forward DNS verification (Google's documented method). Googlebot, Bingbot, Slurp, DuckDuckBot, Baiduspider, YandexBot, and Applebot are supported. Results are cached 1 hour. On by default; disable with `verifyCrawlers: false` (Node/Edge/Next/Flask/FastAPI) or `AGENTPAYMENTS_VERIFY_CRAWLERS = False` (Django). Remaining: IPv6 reverse DNS not yet supported in the edge DoH path.
 
-### Legacy browser fallout
-Browsers that don't send `Sec-Fetch-*` headers are classified as agents and shown a payment demand. Add a fallback signal (UA heuristic + Accept header) before classifying a request as an agent.
+### Legacy browser fallout — **fixed**
+Browsers without `Sec-Fetch-*` headers (Chrome < 76, Firefox < 90, some mobile WebViews) got a 402. Fixed: `isBrowser` now falls back to a UA regex (Chrome, Chromium, Firefox, Safari, Edge, Opera, Samsung Browser, UC Browser) when Sec-Fetch headers are absent, with an explicit bot-UA exclusion to stop scrapers spoofing a browser UA.
 
 ### Pluggable state backends
 Rate limiter and payment cache are in-memory Maps — per-isolate on Cloudflare/Vercel, so limits barely apply and every isolate re-scans the chain. Support Cloudflare KV/Durable Objects, Redis, and a database-backed store; keep in-memory as the dev default.
@@ -62,15 +64,15 @@ Publish `@agentpayments/node`, `@agentpayments/edge`, `@agentpayments/next` to n
 - Structured logging for Python SDK (Node/Edge already have it).
 - Configurable cookie lifetime and challenge difficulty.
 
-## Test plan (currently zero automated tests)
+## Test plan — **initial suites written and passing**
 
-| Suite | Coverage |
-|---|---|
-| Unit (per SDK) | Key generate/validate round-trip, malformed/truncated keys, cookie expiry & tampering, nonce expiry & tampering, rate-limiter windows, cache TTL/eviction |
-| Cross-runtime parity | Same secret produces identical keys/cookies/nonce signatures across Node, Edge, Python; cookie issued by one runtime validates in another |
-| Payment verification (mocked RPC) | Wrong mint, wrong destination, plain `transfer` of junk token, partial amount, memo-only tx, failed tx (`err` set), inner instructions, vendor with no ATA |
-| Adversarial regression | Faked `Sec-Fetch-*` headers, junk `fp`, replayed nonces, crafted transactions referencing the vendor wallet without paying it |
-| E2E | Script hitting all four live deployments: browser flow, agent 402 flow, paid-key flow, public paths (already in TODO — add to CI) |
-| Load | Unpaid-key flood to confirm RPC DoS mitigations hold |
+| Suite | Coverage | Status |
+|---|---|---|
+| Unit (per SDK) | Key generate/validate round-trip, malformed/truncated keys, cookie expiry & tampering, nonce expiry & tampering, rate-limiter windows, cache TTL/eviction | **done** — 30 Node tests (`sdk/node/index.test.js`), 96 Python tests (`sdk/python/tests/test_core.py`) |
+| Cross-runtime parity | Same secret produces identical keys/cookies/nonce signatures across Node and Python | **done** — covered in both suites |
+| Payment verification (mocked RPC) | Wrong mint, wrong destination, partial amount, failed tx (`err` set on sig), no ATAs, TX cap, positive/negative cache | **done** — covered in both suites |
+| Adversarial regression | Faked `Sec-Fetch-*` headers, junk `fp`, replayed nonces, tampered keys/cookies, keys from wrong secret | **done** — covered in both suites |
+| E2E | Script hitting all four live deployments: browser flow, agent 402 flow, paid-key flow, public paths | pending — add to CI |
+| Load | Unpaid-key flood to confirm RPC DoS mitigations hold | pending |
 
-Suggested tooling: `node:test` for Node/Edge (Edge via miniflare/workerd), `pytest` for Python, GitHub Actions for CI.
+Run: `node --test sdk/node/index.test.js` and `cd sdk/python && pytest tests/`.

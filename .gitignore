@@ -1,7 +1,9 @@
 .env
 .venv*/
 __pycache__/
-jsons/.test-keypair.json
+# Wallet key files — never commit secret keys. Purge history with git-filter-repo
+# if any have already been committed (see ROADMAP P0 #7).
+jsons/
 
 # JS/Next build artifacts
 node_modules/

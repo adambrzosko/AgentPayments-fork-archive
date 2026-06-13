@@ -16,10 +16,12 @@ AgentPayments sits at the edge of a web application and decides whether to allow
 | **Bulk cookie minting** | Scripted client solves challenges at scale | SHA-256 proof-of-work (~16^4 hashes per cookie, configurable) |
 | **Faked browser headers** | Scraper sends `Sec-Fetch-*` headers to reach the challenge | Challenge requires proof-of-work + server-validated fingerprint, not just headers |
 | **Challenge endpoint abuse** | Attacker brute-forces verification to extract cookies | Rate limiting (20 req/min/IP) |
+| **Agent-key RPC flooding** | Attacker floods the agent-key path to exhaust RPC quota | Separate rate limit (10 req/min/IP) + negative result cache (30 s) + 20-TX cap per scan |
+| **SEO crawler blocked** | Search crawlers receive 402, site deindexed | Verified-crawler allowlist: UA match + reverse/forward DNS — on by default |
 | **Oversized input injection** | Attacker sends huge payloads to cause memory issues | Input size limits on all user-supplied fields |
 | **Invalid wallet address** | Misconfigured wallet causes silent payment failures | Base58 validation at init time |
 | **Insecure default secret** | Deployed with `default-secret-change-me` | Warns in debug, throws/500s in production |
-| **Redundant RPC calls** | Repeated on-chain lookups for the same agent key | Payment verification cache (10-min TTL) |
+| **Redundant RPC calls** | Repeated on-chain lookups for the same agent key | Payment verification cache (10-min TTL for positive, 30-s for negative) |
 | **Bot detection bypass** | Headless browsers pass the challenge | Canvas fingerprint + `navigator.webdriver` check |
 
 ## Cryptographic Primitives
@@ -126,21 +128,38 @@ Wallet addresses are validated against the base58 regex `/^[1-9A-HJ-NP-Za-km-z]{
 
 ## Rate Limiting
 
-The `/__challenge/verify` endpoint is rate-limited to **20 requests per minute per IP**.
+Two independent rate limits protect the two verification paths:
 
-- Node/Edge: in-memory `Map` with sliding window cleanup.
-- Python: thread-safe `RateLimiter` class with `threading.Lock`.
+| Path | Limit | Rationale |
+|---|---|---|
+| `/__challenge/verify` | 20 req/min/IP | Stops brute-force of browser challenge |
+| Agent-key verification | 10 req/min/IP | Stricter — unpaid keys trigger RPC scans |
 
-Exceeding the limit returns `429 Too Many Requests`.
+Implementation: in-memory sliding window (Node/Edge), thread-safe `RateLimiter` class (Python). Exceeding either limit returns `429 Too Many Requests`.
 
 ## Payment Verification Cache
 
-Successful on-chain payment verifications are cached to avoid repeated Solana RPC calls:
+On-chain payment verifications are cached to avoid repeated Solana RPC calls:
 
-- **TTL**: 10 minutes
+| Result | TTL | Effect |
+|---|---|---|
+| Positive (paid) | 10 minutes | Subsequent requests bypass RPC entirely |
+| Negative (not paid) | 30 seconds | Prevents repeat RPC floods for unknown keys |
+
 - **Max entries**: 1,000 (oldest evicted first)
 - **Key**: agent key string
-- Cache miss triggers a fresh RPC verification; cache hit returns immediately.
+- Each `getTransaction` scan is also capped at **20 calls** per verification to bound worst-case RPC usage.
+
+## Verified Crawler Allowlist
+
+Search crawlers bypass the gate entirely. Verification uses the reverse+forward DNS method published by Google:
+
+1. UA string matches a known crawler pattern (Googlebot, Bingbot, etc.).
+2. Reverse DNS lookup on the client IP returns a hostname.
+3. Hostname ends with the crawler's published PTR suffix (e.g. `.googlebot.com`).
+4. Forward DNS lookup of that hostname includes the original IP.
+
+Results are cached for 1 hour per IP. Enabled by default; disable with `verifyCrawlers: false` (Node/Edge/Next/Flask/FastAPI) or `AGENTPAYMENTS_VERIFY_CRAWLERS = False` (Django). Supported crawlers: Googlebot, Google InspectionTool, Bingbot, Yahoo Slurp, DuckDuckBot, Baiduspider, YandexBot, Applebot.
 
 ## Default Secret Detection
 

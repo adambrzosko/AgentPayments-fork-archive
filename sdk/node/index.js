@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const dns = require('node:dns').promises;
 const {
   COOKIE_NAME, COOKIE_MAX_AGE, KEY_PREFIX,
   USDC_MINT_DEVNET, USDC_MINT_MAINNET,
@@ -6,29 +7,32 @@ const {
   MEMO_PROGRAM, MIN_PAYMENT,
   MAX_KEY_LENGTH, MAX_NONCE_LENGTH, MAX_RETURN_TO_LENGTH, MAX_FP_LENGTH,
   POW_DIFFICULTY, MAX_POW_LENGTH, NONCE_TTL_MS,
+  NEGATIVE_CACHE_TTL_MS,
+  MAX_TRANSACTIONS_PER_VERIFY,
+  AGENT_KEY_RATE_LIMIT_MAX,
 } = require('../constants.json');
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const PAYMENT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 const PAYMENT_CACHE_MAX = 1000;
 
 class PaymentCache {
-  constructor(ttl = PAYMENT_CACHE_TTL, maxSize = PAYMENT_CACHE_MAX) {
-    this.ttl = ttl;
+  constructor(maxSize = PAYMENT_CACHE_MAX) {
     this.maxSize = maxSize;
     this.cache = new Map();
   }
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) return undefined;
-    if (Date.now() - entry.ts > this.ttl) { this.cache.delete(key); return undefined; }
+    if (Date.now() - entry.ts > entry.ttl) { this.cache.delete(key); return undefined; }
     return entry.value;
   }
-  set(key, value) {
+  // ttlMs defaults to PAYMENT_CACHE_TTL for positive results; pass NEGATIVE_CACHE_TTL_MS for negatives.
+  set(key, value, ttlMs = PAYMENT_CACHE_TTL) {
     if (this.cache.size >= this.maxSize) {
       const oldest = this.cache.keys().next().value;
       this.cache.delete(oldest);
     }
-    this.cache.set(key, { value, ts: Date.now() });
+    this.cache.set(key, { value, ts: Date.now(), ttl: ttlMs });
   }
 }
 
@@ -65,6 +69,49 @@ class RateLimiter {
       if (now - entry.start > this.windowMs) this.hits.delete(key);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Verified crawler allowlist
+// UA heuristic + reverse/forward DNS verification (Google's documented method).
+// Results are cached for 1 hour to avoid repeated DNS lookups.
+// ---------------------------------------------------------------------------
+const CRAWLER_PATTERNS = [
+  { pattern: /googlebot/i,     suffix: '.googlebot.com' },
+  { pattern: /google-inspectiontool/i, suffix: '.google.com' },
+  { pattern: /bingbot/i,       suffix: '.search.msn.com' },
+  { pattern: /slurp/i,         suffix: '.crawl.yahoo.net' },
+  { pattern: /duckduckbot/i,   suffix: '.duckduckgo.com' },
+  { pattern: /baiduspider/i,   suffix: '.crawl.baidu.com' },
+  { pattern: /yandexbot/i,     suffix: '.yandex.com' },
+  { pattern: /applebot/i,      suffix: '.applebot.apple.com' },
+];
+const CRAWLER_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const _crawlerCache = new Map(); // ip -> { verified: boolean, exp: number }
+
+async function isVerifiedCrawler(ip, userAgent) {
+  if (!userAgent || !ip || ip === 'unknown') return false;
+  const match = CRAWLER_PATTERNS.find((c) => c.pattern.test(userAgent));
+  if (!match) return false;
+
+  const cached = _crawlerCache.get(ip);
+  if (cached && cached.exp > Date.now()) return cached.verified;
+
+  let verified = false;
+  try {
+    const hostnames = await dns.reverse(ip);
+    if (hostnames.length > 0) {
+      const hostname = hostnames[0];
+      if (hostname.endsWith(match.suffix)) {
+        // Forward verify: resolve hostname back and confirm it contains the original IP.
+        const addrs = await dns.lookup(hostname, { all: true });
+        verified = addrs.some((a) => a.address === ip);
+      }
+    }
+  } catch { /* DNS failure = not verified */ }
+
+  _crawlerCache.set(ip, { verified, exp: Date.now() + CRAWLER_CACHE_TTL });
+  return verified;
 }
 
 function hmacSign(data, secret) {
@@ -195,8 +242,14 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, m
       }
     }
 
+    let txCallCount = 0;
     for (const sigInfo of allSignatures) {
+      if (txCallCount >= MAX_TRANSACTIONS_PER_VERIFY) {
+        gateLog('warn', 'getTransaction cap reached', { key: agentKey.slice(0, 12) + '...', cap: MAX_TRANSACTIONS_PER_VERIFY });
+        break;
+      }
       if (sigInfo.err) continue;
+      txCallCount++;
 
       const txData = await rpcCall(rpcUrl, 'getTransaction', [
         sigInfo.signature,
@@ -271,8 +324,15 @@ function isPublicPath(pathname) {
   return false;
 }
 
+// Sec-Fetch-* headers were introduced in Chrome 76 (2019) and Firefox 90 (2021).
+// Fall back to UA heuristic for older browsers so they get a challenge, not a 402.
+const BROWSER_UA_RE = /(Chrome|Chromium|Firefox|Safari|Edg|OPR|Opera|SamsungBrowser|UCBrowser|Mobile Safari)/i;
+const BOT_UA_RE = /bot|crawl|spider|slurp|mediapartners|adsbot/i;
+
 function isBrowser(req) {
-  return Boolean(req.headers['sec-fetch-mode'] || req.headers['sec-fetch-dest']);
+  if (req.headers['sec-fetch-mode'] || req.headers['sec-fetch-dest']) return true;
+  const ua = req.headers['user-agent'] || '';
+  return Boolean(ua && !BOT_UA_RE.test(ua) && BROWSER_UA_RE.test(ua));
 }
 
 function challengePage(returnTo, nonce, powDifficulty = POW_DIFFICULTY) {
@@ -340,6 +400,15 @@ function agentPaymentsGate(config = {}) {
     minPayment = MIN_PAYMENT,
     powDifficulty = POW_DIFFICULTY,
     debug = process.env.DEBUG !== 'false',
+    // When true (default), verified search crawlers (Googlebot, Bingbot, etc.)
+    // are allowed through without a challenge or payment. Verification uses
+    // reverse+forward DNS so it adds latency only on the first request per IP.
+    verifyCrawlers = true,
+    // Optional persistent grant store. Once a key is added it is never
+    // re-scanned on-chain, making paid access durable across wallet history
+    // window limits. See sdk/node/grant-store.js for FileGrantStore.
+    // Interface: { has(key): boolean, add(key): void } (sync or async).
+    grantStore = null,
   } = config;
 
   const secret = challengeSecret || 'default-secret-change-me';
@@ -358,14 +427,22 @@ function agentPaymentsGate(config = {}) {
   const mint = usdcMint || (debug ? USDC_MINT_DEVNET : USDC_MINT_MAINNET);
   const network = debug ? 'devnet' : 'mainnet-beta';
   const paymentCache = new PaymentCache();
-  const rateLimiter = new RateLimiter();
+  const rateLimiter = new RateLimiter();                                          // challenge verify: 20/min
+  const agentKeyRateLimiter = new RateLimiter(RATE_LIMIT_WINDOW, AGENT_KEY_RATE_LIMIT_MAX); // agent key verify: 10/min
   const consumedNonces = new ConsumedNonces();
-  setInterval(() => { rateLimiter.cleanup(); consumedNonces.cleanup(); }, 60000).unref();
+  setInterval(() => { rateLimiter.cleanup(); agentKeyRateLimiter.cleanup(); consumedNonces.cleanup(); }, 60000).unref();
 
   return async function agentPaymentsGateMiddleware(req, res, next) {
     const pathname = req.path;
 
     if (isPublicPath(pathname)) return next();
+
+    // Verified search crawlers bypass the gate entirely (no challenge, no payment).
+    if (verifyCrawlers) {
+      const clientIpForCrawler = getClientIp(req);
+      const ua = req.headers['user-agent'] || '';
+      if (await isVerifiedCrawler(clientIpForCrawler, ua)) return next();
+    }
 
     if (pathname === '/__challenge/verify' && req.method === 'POST') {
       const clientIp = getClientIp(req);
@@ -447,14 +524,32 @@ function agentPaymentsGate(config = {}) {
         });
       }
 
+      // Rate-limit the verification path separately from the challenge endpoint.
+      if (!agentKeyRateLimiter.check(getClientIp(req))) {
+        return json(res, 429, { error: 'rate_limited', message: 'Too many payment verification requests. Please wait and try again.' });
+      }
+
       if (!walletAddress) {
         return json(res, 500, { error: 'server_error', message: 'Payment verification unavailable.' });
       }
 
+      // Grant store: durable check that survives the 100-tx wallet history window.
+      if (grantStore && await grantStore.has(agentKey)) return next();
+
       const cached = paymentCache.get(agentKey);
       if (cached === true) return next();
+      if (cached === false) {
+        // Negative result cached — skip the RPC scan until the TTL expires.
+        return json(res, 402, {
+          error: 'payment_required',
+          message: 'Key is valid but payment has not been verified on-chain yet. Please send the USDC payment and allow a few moments for confirmation.',
+          your_key: agentKey,
+          payment: { chain: 'solana', network, token: 'USDC', amount: String(minPayment), wallet_address: walletAddress, memo: agentKey },
+        });
+      }
       const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, mint, minPayment);
-      if (paid) paymentCache.set(agentKey, true);
+      paymentCache.set(agentKey, paid, paid ? PAYMENT_CACHE_TTL : NEGATIVE_CACHE_TTL_MS);
+      if (paid && grantStore) await grantStore.add(agentKey);
       if (!paid) {
         return json(res, 402, {
           error: 'payment_required',
