@@ -29,6 +29,8 @@ A request is classified as a "browser" if it includes either of these headers:
 - `Sec-Fetch-Mode`
 - `Sec-Fetch-Dest`
 
+If these headers are absent, the gate falls back to a browser `User-Agent` heuristic (Chrome/Firefox/Safari/Edge/etc.) with an explicit bot/crawler UA exclusion.
+
 All other requests (curl, AI agents, API clients) are treated as non-browser.
 
 ## Agent Key Flow
