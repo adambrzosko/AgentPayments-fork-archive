@@ -39,12 +39,12 @@ class GateMiddleware:
                 logger.warning("Using default CHALLENGE_SECRET. Set a strong secret before deploying to production.")
             else:
                 raise RuntimeError("CHALLENGE_SECRET is set to the insecure default. Set a strong, unique secret for production.")
-        wallet_address = settings.HOME_WALLET_ADDRESS
+        wallet_address = getattr(settings, "HOME_WALLET_ADDRESS", None)
         if wallet_address and not is_valid_solana_address(wallet_address):
             raise ValueError(f"HOME_WALLET_ADDRESS '{wallet_address}' is not a valid Solana public key (expected 32-44 base58 characters).")
         debug = settings.DEBUG
-        rpc_url = settings.SOLANA_RPC_URL or (RPC_DEVNET if debug else RPC_MAINNET)
-        usdc_mint = settings.USDC_MINT or (USDC_MINT_DEVNET if debug else USDC_MINT_MAINNET)
+        rpc_url = getattr(settings, "SOLANA_RPC_URL", None) or (RPC_DEVNET if debug else RPC_MAINNET)
+        usdc_mint = getattr(settings, "USDC_MINT", None) or (USDC_MINT_DEVNET if debug else USDC_MINT_MAINNET)
 
         self.secret = secret
         self.wallet_address = wallet_address
