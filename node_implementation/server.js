@@ -19,9 +19,8 @@ app.use(express.urlencoded({ extended: false }));
 // const { agentPaymentsGate } = require('@agentpayments/node');
 app.use(agentPaymentsGate({
   challengeSecret: process.env.CHALLENGE_SECRET,
-  homeWalletAddress: process.env.HOME_WALLET_ADDRESS,
-  solanaRpcUrl: process.env.SOLANA_RPC_URL,
-  usdcMint: process.env.USDC_MINT,
+  verifyUrl: process.env.AGENTPAYMENTS_VERIFY_URL,
+  apiKey: process.env.AGENTPAYMENTS_API_KEY,
 }));
 
 app.get('/.well-known/agent-access.json', (_req, res) => {
@@ -38,6 +37,10 @@ app.get('*', (_req, res) => {
   res.sendFile(path.join(staticDir, 'index.html'));
 });
 
-app.listen(port, host, () => {
-  console.log(`Node deployment listening on http://${host}:${port}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(port, host, () => {
+    console.log(`Node deployment listening on http://${host}:${port}`);
+  });
+}
+
+module.exports = app;

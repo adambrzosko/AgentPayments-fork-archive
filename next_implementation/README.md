@@ -13,9 +13,7 @@ npm run dev
 ## Vercel
 Set these env vars in project settings:
 - CHALLENGE_SECRET
-- HOME_WALLET_ADDRESS
-- SOLANA_RPC_URL (optional)
-- USDC_MINT (optional)
-- DEBUG
+- AGENTPAYMENTS_VERIFY_URL
+- AGENTPAYMENTS_API_KEY
 
 For this monorepo setup, deploy with project root set to `next_implementation` from the repo root (so `file:../sdk/next` resolves during install).
