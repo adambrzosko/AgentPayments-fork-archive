@@ -4,8 +4,12 @@ import { createVercelEdgeGate } from '../edge/vercel.js';
 export function createNextMiddleware(options = {}) {
   const env = options.env || {
     CHALLENGE_SECRET: process.env.CHALLENGE_SECRET,
-    AGENTPAYMENTS_VERIFY_URL: process.env.AGENTPAYMENTS_VERIFY_URL,
+    HOME_WALLET_ADDRESS: process.env.HOME_WALLET_ADDRESS,
+    SOLANA_RPC_URL: process.env.SOLANA_RPC_URL,
+    USDC_MINT: process.env.USDC_MINT,
+    DEBUG: process.env.DEBUG,
     AGENTPAYMENTS_API_KEY: process.env.AGENTPAYMENTS_API_KEY,
+    AGENTPAYMENTS_PLATFORM_URL: process.env.AGENTPAYMENTS_PLATFORM_URL,
   };
 
   return createVercelEdgeGate({

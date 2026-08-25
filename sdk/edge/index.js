@@ -154,7 +154,7 @@ async function _getHmacKey(secret) {
   return key;
 }
 
-async function hmacSign(data, secret) {
+export async function hmacSign(data, secret) {
   const key = await _getHmacKey(secret);
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
   return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -190,7 +190,7 @@ async function sha256Hex(data) {
 
 // Short HMAC of the client IP. Used to bind nonces and cookies to the client
 // that solved the challenge, so a captured cookie is useless from another IP.
-async function clientIdForIp(ip, secret) {
+export async function clientIdForIp(ip, secret) {
   return (await hmacSign(`client:${ip}`, secret)).slice(0, 16);
 }
 
@@ -208,13 +208,13 @@ async function verifyPow(nonce, pow, difficulty) {
   return (await sha256Hex(`${nonce}:${pow}`)).startsWith('0'.repeat(difficulty));
 }
 
-async function generateAgentKey(secret) {
+export async function generateAgentKey(secret) {
   const random = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
   const sig = await hmacSign(random, secret);
   return `${KEY_PREFIX}${random}_${sig.slice(0, 16)}`;
 }
 
-async function isValidAgentKey(key, secret) {
+export async function isValidAgentKey(key, secret) {
   if (!key || key.length > MAX_KEY_LENGTH || !key.startsWith(KEY_PREFIX)) return false;
   const rest = key.slice(KEY_PREFIX.length);
   const underscoreIndex = rest.indexOf('_');
@@ -408,13 +408,13 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint) 
   return false;
 }
 
-function getCookie(request, name) {
+export function getCookie(request, name) {
   const cookies = request.headers.get('cookie') || '';
   const match = cookies.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-async function isValidCookie(request, secret, clientIp) {
+export async function isValidCookie(request, secret, clientIp) {
   const cookie = getCookie(request, COOKIE_NAME);
   if (!cookie) return false;
   const dotIndex = cookie.indexOf('.');
@@ -429,7 +429,7 @@ async function isValidCookie(request, secret, clientIp) {
   return timingSafeEqual(signature, expected);
 }
 
-function isPublicPath(pathname, allowlist = []) {
+export function isPublicPath(pathname, allowlist = []) {
   if (pathname === '/robots.txt') return true;
   if (pathname.startsWith('/.well-known/')) return true;
   if (allowlist.includes(pathname)) return true;
@@ -439,13 +439,13 @@ function isPublicPath(pathname, allowlist = []) {
 const BROWSER_UA_RE = /(Chrome|Chromium|Firefox|Safari|Edg|OPR|Opera|SamsungBrowser|UCBrowser|Mobile Safari)/i;
 const BOT_UA_RE = /bot|crawl|spider|slurp|mediapartners|adsbot/i;
 
-function isBrowser(request) {
+export function isBrowser(request) {
   if (request.headers.get('sec-fetch-mode') || request.headers.get('sec-fetch-dest')) return true;
   const ua = request.headers.get('user-agent') || '';
   return Boolean(ua && !BOT_UA_RE.test(ua) && BROWSER_UA_RE.test(ua));
 }
 
-function jsonResponse(body, status) {
+export function jsonResponse(body, status) {
   return new Response(JSON.stringify(body, null, 2), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
@@ -490,7 +490,7 @@ function paymentRequiredResponse(body, x402Opts) {
   });
 }
 
-function challengePage(returnTo, nonce, powDifficulty = POW_DIFFICULTY) {
+export function challengePage(returnTo, nonce, powDifficulty = POW_DIFFICULTY) {
   const safePath = (returnTo.startsWith('/') && !returnTo.startsWith('//')) ? returnTo : '/';
   const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Verifying your access...</title><style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#fafafa;color:#333}main{text-align:center;padding:2rem}.spinner{width:40px;height:40px;border:4px solid #e0e0e0;border-top-color:#333;border-radius:50%;animation:spin .8s linear infinite;margin:1rem auto}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body><main role="status" aria-live="polite"><div class="spinner" aria-hidden="true"></div><p>Verifying your access&hellip;</p><noscript><p><strong>JavaScript is required to verify your access. Please enable JavaScript and reload this page.</strong></p></noscript></main><script>(function(){if(navigator.webdriver)return;if(!window.crypto||!window.crypto.subtle)return;var c=document.createElement("canvas");c.width=200;c.height=50;var ctx=c.getContext("2d");if(!ctx)return;ctx.font="18px Arial";ctx.fillStyle="#1a1a2e";ctx.fillText("verify",10,30);var data=c.toDataURL();if(!data||data.length<100)return;if(typeof window.innerWidth==="undefined"||window.innerWidth===0)return;var nonce=${JSON.stringify(nonce)};var target=${JSON.stringify('0'.repeat(powDifficulty))};var enc=new TextEncoder();var i=0;function submit(pow){var form=document.createElement("form");form.method="POST";form.action="/__challenge/verify";var fields={nonce:nonce,return_to:${JSON.stringify(safePath)},fp:data.slice(22,86),pow:pow};for(var key in fields){var input=document.createElement("input");input.type="hidden";input.name=key;input.value=fields[key];form.appendChild(input);}document.body.appendChild(form);form.submit();}function mine(){window.crypto.subtle.digest("SHA-256",enc.encode(nonce+":"+i)).then(function(buf){var b=new Uint8Array(buf);var h="";for(var j=0;j<4;j++)h+=(b[j]<16?"0":"")+b[j].toString(16);if(h.slice(0,target.length)===target)return submit(String(i));i++;mine();});}mine();})();</script></body></html>`;
   return new Response(html, {

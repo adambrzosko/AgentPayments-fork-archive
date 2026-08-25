@@ -15,5 +15,6 @@ node_modules/
 .vercel/
 next_implementation/node_modules/
 next_implementation/.next/
-next_implementation/.vercel/llm_wallet_hub/data/db.json
+next_implementation/.vercel/
+llm_wallet_hub/data/db.json
 .vercel

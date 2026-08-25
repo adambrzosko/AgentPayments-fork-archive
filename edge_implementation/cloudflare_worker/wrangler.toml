@@ -19,8 +19,11 @@ run_worker_first = true
 # id = "REPLACE_WITH_OUTPUT_OF_wrangler_kv_namespace_create"
 
 [vars]
-# Verification service (standalone, not llm_wallet_hub)
-AGENTPAYMENTS_VERIFY_URL = "https://your-verify-service.example.com/verify"
+DEBUG = "true"
+HOME_WALLET_ADDRESS = "5rXZeAEbg13DQnSFijEno2hKEJLK2p14fAo3AmPtfBft"
 # Set these in production via `wrangler secret put` / dashboard:
 # CHALLENGE_SECRET
-# AGENTPAYMENTS_API_KEY (per-merchant API key from verify service)
+# HOME_WALLET_ADDRESS
+# SOLANA_RPC_URL
+# USDC_MINT
+# AGENTPAYMENTS_API_KEY (optional — enables hosted key issuance via api.agentpayments.dev)

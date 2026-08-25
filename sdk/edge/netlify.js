@@ -10,8 +10,12 @@ export function createNetlifyGate(options = {}) {
     getClientIp: ({ context }) => context?.ip || 'unknown',
     envResolver: () => ({
       CHALLENGE_SECRET: Deno.env.get('CHALLENGE_SECRET') || 'default-secret-change-me',
-      AGENTPAYMENTS_VERIFY_URL: Deno.env.get('AGENTPAYMENTS_VERIFY_URL') || '',
+      HOME_WALLET_ADDRESS: Deno.env.get('HOME_WALLET_ADDRESS') || '',
+      SOLANA_RPC_URL: Deno.env.get('SOLANA_RPC_URL') || '',
+      USDC_MINT: Deno.env.get('USDC_MINT') || '',
+      DEBUG: Deno.env.get('DEBUG') || '',
       AGENTPAYMENTS_API_KEY: Deno.env.get('AGENTPAYMENTS_API_KEY') || '',
+      AGENTPAYMENTS_PLATFORM_URL: Deno.env.get('AGENTPAYMENTS_PLATFORM_URL') || '',
     }),
     fetchUpstream: (request, _env, context) => context.next(request),
   });

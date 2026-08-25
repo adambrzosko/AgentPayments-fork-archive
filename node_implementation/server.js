@@ -19,7 +19,9 @@ app.use(express.urlencoded({ extended: false }));
 // const { agentPaymentsGate } = require('@agentpayments/node');
 app.use(agentPaymentsGate({
   challengeSecret: process.env.CHALLENGE_SECRET,
-  verifyUrl: process.env.AGENTPAYMENTS_VERIFY_URL,
+  homeWalletAddress: process.env.HOME_WALLET_ADDRESS,
+  solanaRpcUrl: process.env.SOLANA_RPC_URL,
+  usdcMint: process.env.USDC_MINT,
   apiKey: process.env.AGENTPAYMENTS_API_KEY,
 }));
 
