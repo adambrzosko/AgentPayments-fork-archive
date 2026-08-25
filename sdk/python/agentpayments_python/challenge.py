@@ -102,7 +102,9 @@ def validate_challenge_submission(
 
 
 def challenge_html(return_to: str, nonce: str, pow_difficulty: int = POW_DIFFICULTY) -> str:
-    safe_path = return_to if return_to.startswith("/") else "/"
+    # Reject protocol-relative URLs (e.g. //attacker.com) which start with '/'
+    # but are treated as external by browsers.
+    safe_path = return_to if (return_to.startswith("/") and not return_to.startswith("//")) else "/"
     nonce_json = json.dumps(nonce)
     safe_path_json = json.dumps(safe_path)
     target_json = json.dumps("0" * pow_difficulty)

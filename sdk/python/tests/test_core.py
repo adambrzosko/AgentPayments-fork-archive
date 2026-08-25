@@ -605,7 +605,7 @@ def _build_tx(memo: str, amount: float, mint: str, destination_owner: str, ok=Tr
                             "type": "transferChecked",
                             "info": {
                                 "mint": mint,
-                                "tokenAmount": {"uiAmount": amount},
+                                "tokenAmount": {"uiAmount": amount, "amount": str(round(amount * 1_000_000)), "decimals": 6},
                                 "destination": "dest_ata_address",
                                 "authority": "payer_address",
                             },

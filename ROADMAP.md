@@ -42,11 +42,11 @@ Search crawlers received a 402 like any other non-browser. Fixed: all three SDKs
 ### Legacy browser fallout — **fixed**
 Browsers without `Sec-Fetch-*` headers (Chrome < 76, Firefox < 90, some mobile WebViews) got a 402. Fixed: `isBrowser` now falls back to a UA regex (Chrome, Chromium, Firefox, Safari, Edge, Opera, Samsung Browser, UC Browser) when Sec-Fetch headers are absent, with an explicit bot-UA exclusion to stop scrapers spoofing a browser UA.
 
-### Pluggable state backends
-Rate limiter and payment cache are in-memory Maps — per-isolate on Cloudflare/Vercel, so limits barely apply and every isolate re-scans the chain. Support Cloudflare KV/Durable Objects, Redis, and a database-backed store; keep in-memory as the dev default.
+### Pluggable state backends — **fixed (Node)**
+Rate limiter and payment cache are in-memory Maps — per-isolate on Cloudflare/Vercel, so limits barely apply and every isolate re-scans the chain. Fixed for Node: `sdk/node/redis-store.js` provides `RateLimiter`, `PaymentCache`, and `createRedisStore(redisClient)` — drop-in replacements for the in-memory stores, backed by atomic Lua INCR+EXPIRE for rate limiting and SET EX for payment cache. Fail-open on Redis errors. Pass via `rateLimiter`, `agentKeyRateLimiter`, `paymentCache` options to `agentPaymentsGate`. Edge/Python: still in-memory; Cloudflare KV/Durable Objects adapter is next.
 
-### x402 protocol compatibility
-LLM agents don't reliably parse the custom 402 JSON (noted in TODO). Emit x402-standard response fields/headers alongside the current body so existing agent payment clients interoperate without custom logic.
+### x402 protocol compatibility — **fixed**
+LLM agents don't reliably parse the custom 402 JSON (noted in TODO). Fixed: all three SDKs (Node, Edge, Python) now emit `x402Version: 1`, `accepts: [PaymentRequirements]`, and an `X-PAYMENT-REQUIRED` base64-encoded header on every 402 response, following the x402 SVM `exact` scheme spec. Chain IDs use CAIP-2 format (`solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` mainnet, `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` devnet). Amount is in base units (micro-USDC). x402 utilities also exported from `agentpayments_python` (`build_payment_requirements`, `enrich_402_body`, `payment_required_header`).
 
 ### Production RPC strategy
 Public Solana endpoints heavily rate-limit `getSignaturesForAddress`/`getTransaction`. Document paid RPC (Helius/Triton/QuickNode) as a requirement for production, and add an optional webhook-based payment indexer so verification is a single lookup instead of a chain scan.
@@ -54,8 +54,8 @@ Public Solana endpoints heavily rate-limit `getSignaturesForAddress`/`getTransac
 ### Pricing & access model
 One 0.01 USDC payment currently buys indefinite access. Vendors need: configurable price, payment-amount → access-duration mapping (or per-request metering), per-route pricing tiers, and key revocation.
 
-### Publishing
-Publish `@agentpayments/node`, `@agentpayments/edge`, `@agentpayments/next` to npm and `agentpayments-python` to PyPI. Until installable, nobody integrates.
+### Publishing — **package metadata complete**
+npm packages (`@agentpayments/node`, `@agentpayments/edge`) have `package.json` with description, license, exports, files, keywords, repository, and `publishConfig`. Python package (`agentpayments-python`) has `pyproject.toml` with license, classifiers (Beta, Python 3.10–3.12, MIT), project URLs, and optional extras for each framework. Still required before shipping: README for each package, `npm publish` / `twine upload`, and git tag.
 
 ## P2 — Quality and scale
 

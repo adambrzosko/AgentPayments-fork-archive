@@ -1,0 +1,21 @@
+{
+  "name": "@agentpayments/platform-api",
+  "version": "0.1.0",
+  "description": "AgentPayments hosted key-issuance platform API",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "db:migrate": "psql $DATABASE_URL -f schema.sql"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "nodemailer": "^6.9.13",
+    "pg": "^8.11.5",
+    "stripe": "^15.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

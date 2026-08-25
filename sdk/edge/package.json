@@ -1,7 +1,8 @@
 {
   "name": "@agentpayments/edge",
   "version": "0.1.0",
-  "private": true,
+  "description": "AgentPayments gate for Cloudflare Workers, Netlify Edge, and Vercel Edge Functions — charge AI agents USDC on Solana",
+  "license": "MIT",
   "type": "module",
   "types": "index.d.ts",
   "exports": {
@@ -10,7 +11,35 @@
       "default": "./index.js"
     },
     "./cloudflare": "./cloudflare.js",
+    "./cloudflare-kv-store": "./cloudflare-kv-store.js",
     "./netlify": "./netlify.js",
     "./vercel": "./vercel.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "cloudflare.js",
+    "cloudflare-kv-store.js",
+    "netlify.js",
+    "vercel.js",
+    "README.md"
+  ],
+  "keywords": [
+    "agentpayments",
+    "ai-agents",
+    "solana",
+    "usdc",
+    "payments",
+    "cloudflare-workers",
+    "edge",
+    "x402"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentpayments/agentpayments"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

@@ -48,6 +48,7 @@ _payment_cache = _PaymentCache()
 BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 _constants = json.loads((Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+MIN_PAYMENT_MICRO = round(_constants["MIN_PAYMENT"] * 1_000_000)  # integer micro-USDC threshold
 USDC_MINT_DEVNET = _constants["USDC_MINT_DEVNET"]
 USDC_MINT_MAINNET = _constants["USDC_MINT_MAINNET"]
 RPC_DEVNET = _constants["RPC_DEVNET"]
@@ -78,11 +79,28 @@ def _rpc_call(rpc_url: str, method: str, params: list, retries: int = 2, backoff
     raise last_error
 
 
+def _rpc_call_with_fallback(rpc_urls: list[str], method: str, params: list, **kwargs) -> dict:
+    """Try each RPC URL in order; move to the next on network/5xx failure."""
+    last_error: Exception = RuntimeError("No RPC URLs provided")
+    for url in rpc_urls:
+        try:
+            return _rpc_call(url, method, params, **kwargs)
+        except Exception as exc:
+            last_error = exc
+            if len(rpc_urls) > 1:
+                logger.warning("[gate] RPC endpoint failed, trying fallback: url=%s error=%s", url, exc)
+    raise last_error
+
+
 def is_valid_solana_address(address: str) -> bool:
     return bool(address and BASE58_RE.match(address))
 
 
-def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, usdc_mint: str) -> bool:
+def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url, usdc_mint: str) -> bool:
+    """Verify payment on-chain. rpc_url may be a string or list of strings (fallback URLs)."""
+    # Normalise to list so _rpc_call_with_fallback always gets a list.
+    rpc_urls: list[str] = rpc_url if isinstance(rpc_url, list) else [rpc_url]
+
     cached = _payment_cache.get(agent_key)
     if cached is True:
         return True
@@ -92,7 +110,9 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
         logger.error("[gate] Invalid wallet address: %s", wallet_address)
         return False
     try:
-        ata_data = _rpc_call(rpc_url, "getTokenAccountsByOwner", [wallet_address, {"mint": usdc_mint}, {"encoding": "jsonParsed"}])
+        # commitment: 'finalized' — confirmed blocks can be rolled back (rare but possible).
+        # Finalized adds ~10-20 s latency vs confirmed but guarantees irreversibility.
+        ata_data = _rpc_call_with_fallback(rpc_urls, "getTokenAccountsByOwner", [wallet_address, {"mint": usdc_mint}, {"encoding": "jsonParsed", "commitment": "finalized"}])
         token_accounts = [a["pubkey"] for a in ata_data.get("result", {}).get("value", [])]
         # Only transfers landing in one of the vendor's USDC token accounts count as
         # payment. Token accounts are mint-bound, so membership also guarantees the
@@ -106,7 +126,7 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
         all_signatures = []
 
         for addr in addresses_to_scan:
-            sigs_data = _rpc_call(rpc_url, "getSignaturesForAddress", [addr, {"limit": 100}])
+            sigs_data = _rpc_call_with_fallback(rpc_urls, "getSignaturesForAddress", [addr, {"limit": 100, "commitment": "finalized"}])
             for sig in sigs_data.get("result", []):
                 if sig["signature"] not in seen:
                     seen.add(sig["signature"])
@@ -121,7 +141,7 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
                 continue
             tx_call_count += 1
 
-            tx_data = _rpc_call(rpc_url, "getTransaction", [sig_info["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+            tx_data = _rpc_call_with_fallback(rpc_urls, "getTransaction", [sig_info["signature"], {"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0}])
             tx = tx_data.get("result")
             if not tx:
                 continue
@@ -154,11 +174,16 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url: str, u
                             continue
                         if tx_type == "transferChecked" and info.get("mint") != usdc_mint:
                             continue
-                        token_amount = info.get("tokenAmount", {})
-                        ui_amount = token_amount.get("uiAmount")
-                        if ui_amount is None:
-                            ui_amount = int(info.get("amount", "0")) / 1e6
-                        if ui_amount >= MIN_PAYMENT:
+                        # Integer base-unit comparison — avoids float precision issues at
+                        # the payment threshold. tokenAmount.amount and amount are both
+                        # integer strings in micro-USDC (base units).
+                        token_amount = info.get("tokenAmount") or {}
+                        amount_str = token_amount.get("amount") or info.get("amount", "0")
+                        try:
+                            amount_micro = int(amount_str)
+                        except (ValueError, TypeError):
+                            amount_micro = 0
+                        if amount_micro >= MIN_PAYMENT_MICRO:
                             has_payment = True
 
             if has_memo and has_payment:

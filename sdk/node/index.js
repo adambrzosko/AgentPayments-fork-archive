@@ -10,10 +10,19 @@ const {
   NEGATIVE_CACHE_TTL_MS,
   MAX_TRANSACTIONS_PER_VERIFY,
   AGENT_KEY_RATE_LIMIT_MAX,
+  USDC_DECIMALS,
+  X402_VERSION,
+  SOLANA_CHAIN_ID_MAINNET,
+  SOLANA_CHAIN_ID_DEVNET,
+  PLATFORM_API_URL,
+  HOSTED_KEY_PREFIX,
 } = require('../constants.json');
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const PAYMENT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 const PAYMENT_CACHE_MAX = 1000;
+// Challenge page issuance: more permissive than verify (getting a nonce is cheap),
+// but still rate-limited to prevent offline PoW mining with unlimited nonces.
+const CHALLENGE_ISSUE_RATE_LIMIT_MAX = 30;
 
 class PaymentCache {
   constructor(maxSize = PAYMENT_CACHE_MAX) {
@@ -190,6 +199,76 @@ function isValidAgentKey(key, secret) {
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected.slice(0, 16)));
 }
 
+/**
+ * Verify a platform-issued agent key (agp_ prefix) using the vendor's
+ * verificationSecret (derived by the platform, shared at registration).
+ *
+ * Key format: agp_${vendorId8}_${nonce16}_${sig16}
+ * sig = hmac('agp:vendorId:nonce', verificationSecret).slice(0,16)
+ */
+function isValidHostedKey(key, verificationSecret) {
+  if (!key || !key.startsWith(HOSTED_KEY_PREFIX)) return false;
+  const parts = key.split('_');
+  // Expected: ['agp', vendorId(8), nonce(16), sig(16)] → 4 parts
+  if (parts.length !== 4) return false;
+  const [, vendorId, nonce, sig] = parts;
+  if (!vendorId || !nonce || !sig || sig.length !== 16) return false;
+  const expected = hmacSign(`agp:${vendorId}:${nonce}`, verificationSecret).slice(0, 16);
+  if (expected.length !== sig.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+/**
+ * Thin client for the AgentPayments Platform API.
+ *
+ * Lazily fetches the verificationSecret on first key issuance (one API call per
+ * process restart), then issues keys and verifies them locally with no further
+ * platform round-trips.
+ */
+class PlatformClient {
+  constructor(apiKey, platformUrl = PLATFORM_API_URL) {
+    this.apiKey = apiKey;
+    this.platformUrl = platformUrl.replace(/\/$/, '');
+    this._verificationSecret = null;
+    this._secretFetch = null;
+  }
+
+  _authHeaders() {
+    return { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' };
+  }
+
+  /** Lazily fetch + cache the verificationSecret from the platform. */
+  async getVerificationSecret() {
+    if (this._verificationSecret) return this._verificationSecret;
+    if (this._secretFetch) return this._secretFetch;
+    this._secretFetch = fetch(`${this.platformUrl}/v1/account`, { headers: this._authHeaders() })
+      .then((r) => {
+        if (!r.ok) throw new Error(`Platform /v1/account returned ${r.status}`);
+        return r.json();
+      })
+      .then((data) => {
+        this._verificationSecret = data.verificationSecret;
+        return data.verificationSecret;
+      })
+      .catch((err) => {
+        this._secretFetch = null; // allow retry on next call
+        throw err;
+      });
+    return this._secretFetch;
+  }
+
+  /** Issue a single platform-signed agent key (agp_...). Metered server-side. */
+  async issueKey() {
+    const r = await fetch(`${this.platformUrl}/v1/keys/issue`, {
+      method: 'POST',
+      headers: this._authHeaders(),
+      body: '{}',
+    });
+    if (!r.ok) throw new Error(`Platform /v1/keys/issue returned ${r.status}`);
+    return r.json(); // { key, issuedAt }
+  }
+}
+
 async function rpcCall(rpcUrl, method, params, { retries = 2, backoffMs = 300 } = {}) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -213,12 +292,29 @@ async function rpcCall(rpcUrl, method, params, { retries = 2, backoffMs = 300 } 
   throw lastError;
 }
 
-async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, minPayment = MIN_PAYMENT) {
+// Try each URL in order; move to the next only on network/5xx failure, not on
+// 4xx (which are permanent errors from the endpoint itself).
+async function rpcCallWithFallback(rpcUrls, method, params, opts) {
+  let lastError;
+  for (const url of rpcUrls) {
+    try {
+      return await rpcCall(url, method, params, opts);
+    } catch (err) {
+      lastError = err;
+      if (rpcUrls.length > 1) gateLog('warn', 'RPC endpoint failed, trying fallback', { url, error: err.message });
+    }
+  }
+  throw lastError;
+}
+
+async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, minPayment = MIN_PAYMENT) {
   try {
-    const ataData = await rpcCall(rpcUrl, 'getTokenAccountsByOwner', [
+    // commitment: 'finalized' — confirmed blocks can be rolled back (rare but possible).
+    // Finalized adds ~10-20s latency vs confirmed but guarantees irreversibility.
+    const ataData = await rpcCallWithFallback(rpcUrls, 'getTokenAccountsByOwner', [
       walletAddress,
       { mint: usdcMint },
-      { encoding: 'jsonParsed' },
+      { encoding: 'jsonParsed', commitment: 'finalized' },
     ]);
 
     const tokenAccounts = (ataData.result?.value || []).map((a) => a.pubkey);
@@ -233,7 +329,7 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, m
     const allSignatures = [];
 
     for (const addr of addressesToScan) {
-      const sigsData = await rpcCall(rpcUrl, 'getSignaturesForAddress', [addr, { limit: 100 }]);
+      const sigsData = await rpcCallWithFallback(rpcUrls, 'getSignaturesForAddress', [addr, { limit: 100, commitment: 'finalized' }]);
       for (const sig of sigsData.result || []) {
         if (!seen.has(sig.signature)) {
           seen.add(sig.signature);
@@ -251,9 +347,9 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, m
       if (sigInfo.err) continue;
       txCallCount++;
 
-      const txData = await rpcCall(rpcUrl, 'getTransaction', [
+      const txData = await rpcCallWithFallback(rpcUrls, 'getTransaction', [
         sigInfo.signature,
-        { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
+        { encoding: 'jsonParsed', commitment: 'finalized', maxSupportedTransactionVersion: 0 },
       ]);
       const tx = txData.result;
       if (!tx) continue;
@@ -278,8 +374,13 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, usdcMint, m
             // Payment must be delivered to one of the vendor's USDC token accounts.
             if (!vendorUsdcAccounts.has(info.destination)) continue;
             if (parsed.type === 'transferChecked' && info.mint !== usdcMint) continue;
-            const uiAmount = info.tokenAmount?.uiAmount ?? Number.parseFloat(info.amount || '0') / 1e6;
-            if (uiAmount >= minPayment) hasPayment = true;
+            // Use integer base-unit comparison to avoid float precision issues at
+            // the payment threshold. tokenAmount.amount (transferChecked) and
+            // amount (transfer) are both integer strings in micro-USDC.
+            const amountStr = info.tokenAmount?.amount ?? info.amount ?? '0';
+            const amountMicro = parseInt(amountStr, 10);
+            const minPaymentMicro = Math.round(minPayment * 1e6);
+            if (!Number.isNaN(amountMicro) && amountMicro >= minPaymentMicro) hasPayment = true;
           }
         }
       }
@@ -318,6 +419,12 @@ function isValidCookie(req, secret) {
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
 
+// Detect HTTPS: Express sets req.secure when TLS is terminated at the process;
+// behind a reverse proxy, trust X-Forwarded-Proto (requires app.set('trust proxy')).
+function isHttps(req) {
+  return req.secure || req.headers['x-forwarded-proto']?.startsWith('https');
+}
+
 function isPublicPath(pathname) {
   if (pathname === '/robots.txt') return true;
   if (pathname.startsWith('/.well-known/')) return true;
@@ -336,7 +443,7 @@ function isBrowser(req) {
 }
 
 function challengePage(returnTo, nonce, powDifficulty = POW_DIFFICULTY) {
-  const safePath = returnTo.startsWith('/') ? returnTo : '/';
+  const safePath = (returnTo.startsWith('/') && !returnTo.startsWith('//')) ? returnTo : '/';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -391,6 +498,59 @@ function json(res, status, body) {
   res.status(status).set('Content-Type', 'application/json').send(JSON.stringify(body, null, 2));
 }
 
+/**
+ * Build an x402-standard PaymentRequirements object for the Solana exact scheme.
+ * Spec: https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md
+ *
+ * @param {object} opts
+ * @param {string} opts.walletAddress  - merchant wallet (payTo)
+ * @param {string} opts.mint           - USDC mint address
+ * @param {number} opts.minPayment     - human-readable amount (e.g. 0.01)
+ * @param {boolean} opts.debug         - true → devnet chain ID
+ * @param {string} [opts.agentKey]     - if present, included as extra.memo so
+ *                                       x402 clients know which key to reference
+ * @param {string} [opts.resource]     - URL of the gated resource
+ * @returns {object} PaymentRequirements
+ */
+function buildX402PaymentRequirements({ walletAddress, mint, minPayment, debug, agentKey, resource }) {
+  const chainId = debug ? SOLANA_CHAIN_ID_DEVNET : SOLANA_CHAIN_ID_MAINNET;
+  const baseUnits = String(Math.round(minPayment * Math.pow(10, USDC_DECIMALS)));
+  const req = {
+    scheme: 'exact',
+    network: chainId,
+    amount: baseUnits,
+    asset: mint,
+    payTo: walletAddress,
+    maxTimeoutSeconds: 300,
+    extra: {
+      name: 'USDC',
+      decimals: USDC_DECIMALS,
+      ...(agentKey ? { memo: agentKey } : {}),
+    },
+  };
+  if (resource) req.resource = resource;
+  return req;
+}
+
+/**
+ * Like json() but for 402 responses: adds x402Version, accepts[], and the
+ * X-PAYMENT-REQUIRED header (base64-encoded PaymentRequirements per x402 spec).
+ */
+function paymentRequiredJson(res, body, x402Opts) {
+  const payReq = buildX402PaymentRequirements(x402Opts);
+  const enriched = {
+    x402Version: X402_VERSION,
+    accepts: [payReq],
+    ...body,
+  };
+  const encoded = Buffer.from(JSON.stringify(payReq)).toString('base64');
+  res
+    .status(402)
+    .set('Content-Type', 'application/json')
+    .set('X-PAYMENT-REQUIRED', encoded)
+    .send(JSON.stringify(enriched, null, 2));
+}
+
 function agentPaymentsGate(config = {}) {
   const {
     challengeSecret,
@@ -409,7 +569,42 @@ function agentPaymentsGate(config = {}) {
     // window limits. See sdk/node/grant-store.js for FileGrantStore.
     // Interface: { has(key): boolean, add(key): void } (sync or async).
     grantStore = null,
+    // Optional pluggable rate limiters (drop-in for the built-in in-memory ones).
+    // See sdk/node/redis-store.js for a Redis-backed implementation suitable
+    // for multi-process deployments.  Interface: { check(ip): bool|Promise<bool> }
+    rateLimiter: customRateLimiter = null,
+    agentKeyRateLimiter: customAgentKeyRateLimiter = null,
+    // Optional pluggable payment cache.  Interface: { get(key), set(key,value,ttlMs) }
+    paymentCache: customPaymentCache = null,
+    // Rate limiter for challenge page issuance (browser path). Separate from
+    // the verify-endpoint limiter so a burst of bot traffic can't exhaust
+    // nonces for legitimate browsers. Default: 30 req/min/IP.
+    challengeRateLimiter: customChallengeRateLimiter = null,
+    // When true (default in production), requests that do not arrive over HTTPS
+    // are rejected with 400. Disable in local dev by setting debug: true or
+    // requireHttps: false. Behind a reverse proxy, Express must have
+    // app.set('trust proxy', 1) set for req.secure to be populated correctly.
+    requireHttps: requireHttpsOpt,
+    // -----------------------------------------------------------------------
+    // Hosted key-issuance mode (business model moat):
+    //   apiKey:       Platform API key from api.agentpayments.dev (ap_live_...)
+    //   platformApiUrl: Override for self-hosted platform (default: PLATFORM_API_URL)
+    //
+    // When apiKey is set, agent keys are issued via the platform (metered, billed)
+    // and carry the agp_ prefix. The SDK verifies them locally using the
+    // verificationSecret fetched from the platform at first issuance.
+    // challengeSecret is still required for browser challenge/cookie signing.
+    // -----------------------------------------------------------------------
+    apiKey = null,
+    platformApiUrl = PLATFORM_API_URL,
   } = config;
+
+  // Platform client (hosted issuance mode). Initialized once; verificationSecret
+  // is fetched lazily on first key issuance and cached for the process lifetime.
+  const platformClient = apiKey ? new PlatformClient(apiKey, platformApiUrl) : null;
+  if (platformClient) {
+    gateLog('info', 'Hosted key-issuance mode enabled. Agent keys will be issued via platform.', { platformApiUrl });
+  }
 
   const secret = challengeSecret || 'default-secret-change-me';
   if (secret === 'default-secret-change-me') {
@@ -423,19 +618,32 @@ function agentPaymentsGate(config = {}) {
   if (walletAddress && !BASE58_RE.test(walletAddress)) {
     throw new Error(`[gate] HOME_WALLET_ADDRESS "${walletAddress}" is not a valid Solana public key (expected 32-44 base58 characters).`);
   }
-  const rpcUrl = solanaRpcUrl || (debug ? RPC_DEVNET : RPC_MAINNET);
+  // Normalize rpcUrl to an array so verifyPaymentOnChain can fall back across endpoints.
+  const rpcUrls = (() => {
+    const raw = solanaRpcUrl || (debug ? RPC_DEVNET : RPC_MAINNET);
+    return Array.isArray(raw) ? raw : [raw];
+  })();
+  const requireHttps = requireHttpsOpt ?? !debug; // default: enforce HTTPS in production
   const mint = usdcMint || (debug ? USDC_MINT_DEVNET : USDC_MINT_MAINNET);
   const network = debug ? 'devnet' : 'mainnet-beta';
-  const paymentCache = new PaymentCache();
-  const rateLimiter = new RateLimiter();                                          // challenge verify: 20/min
-  const agentKeyRateLimiter = new RateLimiter(RATE_LIMIT_WINDOW, AGENT_KEY_RATE_LIMIT_MAX); // agent key verify: 10/min
+  const paymentCache = customPaymentCache || new PaymentCache();
+  const rateLimiter = customRateLimiter || new RateLimiter();                                          // challenge verify: 20/min
+  const agentKeyRateLimiter = customAgentKeyRateLimiter || new RateLimiter(RATE_LIMIT_WINDOW, AGENT_KEY_RATE_LIMIT_MAX); // agent key verify: 10/min
+  const challengeIssueRateLimiter = customChallengeRateLimiter || new RateLimiter(RATE_LIMIT_WINDOW, CHALLENGE_ISSUE_RATE_LIMIT_MAX); // challenge issuance: 30/min
   const consumedNonces = new ConsumedNonces();
-  setInterval(() => { rateLimiter.cleanup(); agentKeyRateLimiter.cleanup(); consumedNonces.cleanup(); }, 60000).unref();
+  setInterval(() => { rateLimiter.cleanup?.(); agentKeyRateLimiter.cleanup?.(); challengeIssueRateLimiter.cleanup?.(); consumedNonces.cleanup(); }, 60000).unref();
 
   return async function agentPaymentsGateMiddleware(req, res, next) {
     const pathname = req.path;
 
     if (isPublicPath(pathname)) return next();
+
+    // Reject plaintext HTTP in production. Cookies and agent keys transmitted
+    // over HTTP are visible to network observers. Behind a reverse proxy, set
+    // app.set('trust proxy', 1) so req.secure reflects the upstream protocol.
+    if (requireHttps && !isHttps(req)) {
+      return json(res, 400, { error: 'https_required', message: 'This service requires a secure HTTPS connection.' });
+    }
 
     // Verified search crawlers bypass the gate entirely (no challenge, no payment).
     if (verifyCrawlers) {
@@ -483,7 +691,8 @@ function agentPaymentsGate(config = {}) {
 
       const now = Date.now().toString();
       const cookieSig = hmacSign(`cookie:${now}:${clientId}`, secret);
-      const safePath = returnTo.startsWith('/') ? returnTo : '/';
+      // Reject protocol-relative URLs (//attacker.com starts with '/' but is external).
+      const safePath = (returnTo.startsWith('/') && !returnTo.startsWith('//')) ? returnTo : '/';
 
       res.cookie(COOKIE_NAME, `${now}.${cookieSig}`, {
         maxAge: COOKIE_MAX_AGE * 1000,
@@ -499,8 +708,21 @@ function agentPaymentsGate(config = {}) {
       const agentKey = req.get('X-Agent-Key');
 
       if (!agentKey) {
-        const newKey = generateAgentKey(secret);
-        return json(res, 402, {
+        // Hosted mode: issue a metered platform key (agp_...).
+        // Local mode: generate a self-signed key (ag_...).
+        let newKey;
+        if (platformClient) {
+          try {
+            const issued = await platformClient.issueKey();
+            newKey = issued.key;
+          } catch (err) {
+            gateLog('warn', 'Platform key issuance failed, falling back to local key', { error: err.message });
+            newKey = generateAgentKey(secret);
+          }
+        } else {
+          newKey = generateAgentKey(secret);
+        }
+        return paymentRequiredJson(res, {
           error: 'payment_required',
           message: 'Access requires a paid API key. A key has been generated for you below. Send a USDC payment on Solana with this key as the memo to activate it, then retry your request with the X-Agent-Key header.',
           your_key: newKey,
@@ -513,10 +735,30 @@ function agentPaymentsGate(config = {}) {
             memo: newKey,
             instructions: `Send ${minPayment} USDC on Solana ${debug ? 'devnet' : 'mainnet'} to ${walletAddress} with memo "${newKey}". Then include the header X-Agent-Key: ${newKey} on all subsequent requests.`,
           },
-        });
+        }, { walletAddress, mint, minPayment, debug, agentKey: newKey, resource: req.originalUrl || req.path });
       }
 
-      if (!isValidAgentKey(agentKey, secret)) {
+      // Validate the key. Platform-issued keys (agp_) are verified with the
+      // verificationSecret fetched from the platform; local keys (ag_) with challengeSecret.
+      const isHostedKey = agentKey.startsWith(HOSTED_KEY_PREFIX);
+      if (isHostedKey) {
+        if (!platformClient) {
+          return json(res, 403, {
+            error: 'forbidden',
+            message: 'Platform-issued keys (agp_) require apiKey to be configured.',
+          });
+        }
+        let verSec;
+        try {
+          verSec = await platformClient.getVerificationSecret();
+        } catch (err) {
+          gateLog('error', 'Failed to fetch verificationSecret from platform', { error: err.message });
+          return json(res, 503, { error: 'service_unavailable', message: 'Key verification temporarily unavailable.' });
+        }
+        if (!isValidHostedKey(agentKey, verSec)) {
+          return json(res, 403, { error: 'forbidden', message: 'Invalid API key.' });
+        }
+      } else if (!isValidAgentKey(agentKey, secret)) {
         return json(res, 403, {
           error: 'forbidden',
           message: 'Invalid API key. Keys must be issued by this server.',
@@ -540,18 +782,18 @@ function agentPaymentsGate(config = {}) {
       if (cached === true) return next();
       if (cached === false) {
         // Negative result cached — skip the RPC scan until the TTL expires.
-        return json(res, 402, {
+        return paymentRequiredJson(res, {
           error: 'payment_required',
           message: 'Key is valid but payment has not been verified on-chain yet. Please send the USDC payment and allow a few moments for confirmation.',
           your_key: agentKey,
           payment: { chain: 'solana', network, token: 'USDC', amount: String(minPayment), wallet_address: walletAddress, memo: agentKey },
-        });
+        }, { walletAddress, mint, minPayment, debug, agentKey, resource: req.originalUrl || req.path });
       }
-      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrl, mint, minPayment);
+      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, mint, minPayment);
       paymentCache.set(agentKey, paid, paid ? PAYMENT_CACHE_TTL : NEGATIVE_CACHE_TTL_MS);
       if (paid && grantStore) await grantStore.add(agentKey);
       if (!paid) {
-        return json(res, 402, {
+        return paymentRequiredJson(res, {
           error: 'payment_required',
           message: 'Key is valid but payment has not been verified on-chain yet. Please send the USDC payment and allow a few moments for confirmation.',
           your_key: agentKey,
@@ -563,7 +805,7 @@ function agentPaymentsGate(config = {}) {
             wallet_address: walletAddress,
             memo: agentKey,
           },
-        });
+        }, { walletAddress, mint, minPayment, debug, agentKey, resource: req.originalUrl || req.path });
       }
 
       return next();
@@ -571,12 +813,24 @@ function agentPaymentsGate(config = {}) {
 
     if (isValidCookie(req, secret)) return next();
 
+    // Rate-limit challenge page issuance. Without this, an attacker can request
+    // unlimited nonces and mine PoW offline at native speed.
+    if (!challengeIssueRateLimiter.check(getClientIp(req))) {
+      return json(res, 429, { error: 'rate_limited', message: 'Too many requests. Please try again later.' });
+    }
+
     const nonceTs = Date.now().toString();
     const nonceRand = crypto.randomBytes(8).toString('hex');
     const nonceClientId = clientIdForIp(getClientIp(req), secret);
     const nonceSig = hmacSign(`nonce:${nonceTs}:${nonceRand}:${nonceClientId}`, secret);
-    return res.status(200).set('Cache-Control', 'no-store').set('Content-Type', 'text/html').send(challengePage(req.originalUrl || req.url, `${nonceTs}.${nonceRand}.${nonceSig}`, powDifficulty));
+    return res
+      .status(200)
+      .set('Content-Type', 'text/html')
+      .set('Cache-Control', 'no-store')
+      .set('X-Frame-Options', 'DENY')
+      .set('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'self'")
+      .send(challengePage(req.originalUrl || req.url, `${nonceTs}.${nonceRand}.${nonceSig}`, powDifficulty));
   };
 }
 
-module.exports = { agentPaymentsGate };
+module.exports = { agentPaymentsGate, isValidHostedKey, PlatformClient };

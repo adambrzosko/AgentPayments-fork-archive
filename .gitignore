@@ -5,6 +5,10 @@ __pycache__/
 # if any have already been committed (see ROADMAP P0 #7).
 jsons/
 
+# Platform API — local dev data file (contains API keys)
+api/vendors.json
+api/vendors.json.tmp
+
 # JS/Next build artifacts
 node_modules/
 .next/

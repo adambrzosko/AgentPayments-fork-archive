@@ -38,7 +38,11 @@ Therefore:
 - Edge SDK uses `crypto.subtle` (Web Crypto API) + custom `timingSafeEqual()`, Node SDK uses `node:crypto`.
 - Python uses `hmac.compare_digest()` for all timing-safe comparisons.
 - All SDKs have payment verification caching (10-min TTL, 1000 entries max).
-- All SDKs have rate limiting on challenge verify endpoint (20 req/min/IP).
+- All SDKs have rate limiting on challenge verify endpoint (20 req/min/IP) AND challenge issuance (30 req/min/IP).
+- All SDKs use `commitment: 'finalized'` for Solana RPC calls — adds ~10-20s latency vs confirmed but guarantees irreversibility.
+- `solanaRpcUrl` / `SOLANA_RPC_URL` / `solana_rpc_url` accepts a string or array — fallback across endpoints on failure.
+- `requireHttps` defaults to `true` in production (debug: false) across all SDKs. Behind a proxy, set `trust proxy` (Express) or `SECURE_PROXY_SSL_HEADER` (Django).
+- Edge SDK inlines constants from `sdk/constants.json`. Run `node scripts/check-edge-constants.js` to verify parity.
 - Django reads config from `settings.*`, FastAPI/Flask from constructor args.
 - Edge SDK runs per-request (env resolved each call), Node SDK resolves at init.
 
@@ -55,8 +59,11 @@ Therefore:
 | Change area | Command |
 |---|---|
 | Node SDK | `node -e "require('./sdk/node/index.js')"` |
+| Node tests | `node --test sdk/node/index.test.js` |
 | Edge/Cloudflare | `npx wrangler deploy` from `edge_implementation/cloudflare_worker/` |
+| Edge constants parity | `node scripts/check-edge-constants.js` |
 | Python syntax | `python3 -c "import ast; ast.parse(open(f).read())"` for each changed file |
+| Python tests | `cd sdk/python && python3 -m pytest tests/` |
 | Django | `python python_implementation/django/manage.py check` (requires venv) |
 
 Report any command you could not run and why.
