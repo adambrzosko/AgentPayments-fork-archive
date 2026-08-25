@@ -175,7 +175,8 @@ The HTML page contains a JavaScript challenge that:
 1. Checks `navigator.webdriver` is falsy
 2. Renders a canvas fingerprint
 3. Validates `window.innerWidth > 0`
-4. Auto-submits a hidden form to `/__challenge/verify`
+4. Solves a proof-of-work puzzle via `window.crypto.subtle`: finds a `pow` value such that `SHA-256(nonce + ":" + pow)` starts with `powDifficulty` zero hex digits (browsers without Web Crypto support cannot complete the challenge)
+5. Auto-submits a hidden form to `/__challenge/verify`
 
 ### Step 2: Challenge Verification
 
@@ -184,8 +185,10 @@ The HTML page contains a JavaScript challenge that:
 POST /__challenge/verify HTTP/1.1
 Content-Type: application/x-www-form-urlencoded
 
-nonce=<timestamp>.<hmac>&return_to=/original-path&fp=<canvas-fingerprint>
+nonce=<ts>.<rand>.<hmac>&return_to=/original-path&fp=<canvas-fingerprint>&pow=<pow-value>
 ```
+
+The nonce is `<timestamp>.<random>.<hmac>`, where the HMAC is computed over the timestamp, random component, and a client ID derived from the solver's IP — so a nonce issued to one client can't be redeemed by another. Each nonce can be redeemed exactly once (single-use).
 
 **Response: `302 Found`**
 ```
@@ -202,7 +205,7 @@ Browser includes the `__agp_verified` cookie automatically. The gate validates t
 | Property | Value |
 |---|---|
 | Name | `__agp_verified` |
-| Format | `<timestamp>.<hmac-signature>` |
+| Format | `<timestamp>.<hmac-signature>` — the HMAC is computed over the timestamp and a client ID derived from the solver's IP, so the cookie won't validate if replayed from a different IP |
 | Max Age | 86400 seconds (24 hours) |
 | Path | `/` |
 | HttpOnly | Yes |

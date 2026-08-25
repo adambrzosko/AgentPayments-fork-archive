@@ -69,6 +69,7 @@ class FileGrantStore:
             pass  # will be created on first write
 
     def _save(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(sorted(self._grants), indent=2))
         os.replace(tmp, self._path)

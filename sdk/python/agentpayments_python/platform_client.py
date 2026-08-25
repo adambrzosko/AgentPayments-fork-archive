@@ -13,6 +13,8 @@ Agent keys are verified locally using is_valid_hosted_key() — no per-request
 platform round-trip is needed.
 """
 
+from __future__ import annotations
+
 import hashlib
 import hmac as _hmac
 import json

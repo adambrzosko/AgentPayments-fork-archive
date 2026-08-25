@@ -69,6 +69,7 @@ class FileGrantStore {
   }
 
   _save() {
+    fs.mkdirSync(path.dirname(this._path), { recursive: true });
     const tmp = this._path + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify([...this._grants], null, 2), 'utf8');
     fs.renameSync(tmp, this._path);

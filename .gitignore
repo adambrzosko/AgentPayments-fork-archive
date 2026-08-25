@@ -18,3 +18,7 @@ next_implementation/.next/
 next_implementation/.vercel/
 llm_wallet_hub/data/db.json
 .vercel
+.wrangler/
+
+# Python packaging artifacts
+*.egg-info/
