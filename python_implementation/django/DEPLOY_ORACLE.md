@@ -39,12 +39,10 @@ cp /opt/agentpayments/python_implementation/django/.env.example /opt/agentpaymen
 Edit `python_implementation/django/.env`:
 
 ```dotenv
-DEBUG=false
 DJANGO_SECRET_KEY=<strong-random-secret>
 CHALLENGE_SECRET=<strong-random-secret>
-HOME_WALLET_ADDRESS=<your-wallet>
-SOLANA_RPC_URL=
-USDC_MINT=
+AGENTPAYMENTS_VERIFY_URL=https://your-verify-service.example.com/verify
+AGENTPAYMENTS_API_KEY=<your-api-key>
 ALLOWED_HOSTS=<your-domain-or-public-ip>
 CSRF_TRUSTED_ORIGINS=http://<your-domain-or-public-ip>
 ```

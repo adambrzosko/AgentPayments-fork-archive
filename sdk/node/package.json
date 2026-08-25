@@ -31,6 +31,9 @@
     "express",
     "x402"
   ],
+  "scripts": {
+    "test": "node --test"
+  },
   "engines": {
     "node": ">=20"
   },

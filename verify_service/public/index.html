@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AgentPayments - Get API Key</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 560px; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #666; font-size: 0.95rem; margin-bottom: 2rem; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 24px; }
+    label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 0.95rem; }
+    input { width: 100%; padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 1rem; box-sizing: border-box; }
+    input:focus { outline: none; border-color: #333; }
+    button { padding: 10px 20px; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; width: 100%; margin-top: 12px; }
+    .btn-primary { background: #111; color: #fff; }
+    .btn-primary:hover { background: #333; }
+    .btn-primary:disabled { background: #999; cursor: not-allowed; }
+    .btn-copy { background: #f0f0f0; color: #333; margin-top: 8px; font-size: 0.9rem; }
+    .btn-copy:hover { background: #e0e0e0; }
+    .error { color: #c0392b; margin-top: 12px; font-size: 0.9rem; }
+    .result { margin-top: 1.5rem; }
+    .result h3 { margin-bottom: 8px; font-size: 1.1rem; }
+    .key-box { background: #f7f7f7; border: 1px solid #ddd; border-radius: 8px; padding: 12px; font-family: monospace; font-size: 0.85rem; word-break: break-all; user-select: all; }
+    .instructions { margin-top: 1.5rem; }
+    .instructions h4 { font-size: 0.95rem; margin-bottom: 8px; }
+    pre { background: #f7f7f7; border: 1px solid #ddd; border-radius: 8px; padding: 12px; font-size: 0.82rem; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+    .copied { color: #27ae60; font-size: 0.85rem; margin-top: 4px; }
+    #signup-form, #result { display: block; }
+    #result { display: none; }
+  </style>
+</head>
+<body>
+  <h1>AgentPayments</h1>
+  <p class="subtitle">Gate AI agent access behind USDC payments. Get your API key to start.</p>
+
+  <div class="card">
+    <div id="signup-form">
+      <label for="name">Site name or URL</label>
+      <input id="name" type="text" placeholder="e.g. myapp.com" autocomplete="off" />
+      <button class="btn-primary" id="submit-btn" onclick="signup()">Get API Key</button>
+      <p class="error" id="error"></p>
+    </div>
+
+    <div id="result">
+      <div class="result">
+        <h3>Your API Key</h3>
+        <div class="key-box" id="api-key"></div>
+        <button class="btn-copy" onclick="copyKey()">Copy API Key</button>
+        <p class="copied" id="copy-msg"></p>
+      </div>
+
+      <div class="instructions">
+        <h4>Quick start</h4>
+        <pre id="env-snippet"></pre>
+        <button class="btn-copy" onclick="copySnippet()">Copy env vars</button>
+        <p class="copied" id="copy-snippet-msg"></p>
+      </div>
+
+      <button class="btn-primary" style="margin-top: 1.5rem;" onclick="reset()">Create another key</button>
+    </div>
+  </div>
+
+<script>
+const verifyUrl = window.location.origin;
+
+async function signup() {
+  const name = document.getElementById('name').value.trim();
+  const errorEl = document.getElementById('error');
+  const btn = document.getElementById('submit-btn');
+  errorEl.textContent = '';
+
+  if (!name) { errorEl.textContent = 'Please enter a site name or URL.'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Creating...';
+
+  try {
+    const r = await fetch('/merchants/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    const data = await r.json();
+    if (!r.ok) { errorEl.textContent = data.error || 'Something went wrong.'; return; }
+
+    document.getElementById('api-key').textContent = data.apiKey;
+    document.getElementById('env-snippet').textContent =
+      `CHALLENGE_SECRET=change-me-to-a-strong-secret\nAGENTPAYMENTS_VERIFY_URL=${verifyUrl}/verify\nAGENTPAYMENTS_API_KEY=${data.apiKey}`;
+    document.getElementById('signup-form').style.display = 'none';
+    document.getElementById('result').style.display = 'block';
+  } catch (e) {
+    errorEl.textContent = 'Network error. Please try again.';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Get API Key';
+  }
+}
+
+function copyKey() {
+  navigator.clipboard.writeText(document.getElementById('api-key').textContent);
+  document.getElementById('copy-msg').textContent = 'Copied!';
+  setTimeout(() => document.getElementById('copy-msg').textContent = '', 2000);
+}
+
+function copySnippet() {
+  navigator.clipboard.writeText(document.getElementById('env-snippet').textContent);
+  document.getElementById('copy-snippet-msg').textContent = 'Copied!';
+  setTimeout(() => document.getElementById('copy-snippet-msg').textContent = '', 2000);
+}
+
+function reset() {
+  document.getElementById('signup-form').style.display = 'block';
+  document.getElementById('result').style.display = 'none';
+  document.getElementById('name').value = '';
+  document.getElementById('error').textContent = '';
+}
+
+document.getElementById('name').addEventListener('keydown', e => { if (e.key === 'Enter') signup(); });
+</script>
+</body>
+</html>
