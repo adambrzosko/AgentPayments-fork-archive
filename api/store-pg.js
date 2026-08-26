@@ -13,6 +13,10 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  // rejectUnauthorized: false encrypts the connection but does not verify the server's
+  // certificate (no MITM protection) — standard for managed Postgres with self-signed
+  // certs (e.g. Railway). Acceptable for launch; upgrade to a real CA bundle if the
+  // provider publishes one.
   ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
@@ -101,12 +105,12 @@ module.exports = {
   // Stripe
   // ---------------------------------------------------------------------------
 
-  async setStripeIds(vendorId, stripeCustomerId, stripeSubscriptionItemId) {
+  async setStripeIds(vendorId, stripeCustomerId) {
     await pool.query(
       `UPDATE vendors
-       SET stripe_customer_id = $2, stripe_subscription_item_id = $3
+       SET stripe_customer_id = $2
        WHERE vendor_id = $1`,
-      [vendorId, stripeCustomerId, stripeSubscriptionItemId],
+      [vendorId, stripeCustomerId],
     );
   },
 

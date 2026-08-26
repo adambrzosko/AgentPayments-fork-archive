@@ -75,8 +75,6 @@ async function sendVerificationEmail({ email, name, vendorId, token }) {
       '',
       link,
       '',
-      'This link expires in 24 hours.',
-      '',
       'If you did not sign up, you can ignore this email.',
       '',
       '— The AgentPayments team',
@@ -96,7 +94,7 @@ async function sendVerificationEmail({ email, name, vendorId, token }) {
     </a>
   </p>
   <p style="font-size:13px;color:#666">Or copy this link: <code style="word-break:break-all">${link}</code></p>
-  <p style="font-size:13px;color:#666">This link expires in 24 hours. If you didn't sign up, you can ignore this email.</p>
+  <p style="font-size:13px;color:#666">If you didn't sign up, you can ignore this email.</p>
 </body>
 </html>`,
   });

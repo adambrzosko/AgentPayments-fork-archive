@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS vendors (
   verification_token     VARCHAR(64),
   -- Stripe
   stripe_customer_id         VARCHAR(255),
-  stripe_subscription_item_id VARCHAR(255),
   -- Metadata
   created_at             BIGINT       NOT NULL
 );

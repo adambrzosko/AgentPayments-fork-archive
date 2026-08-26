@@ -53,7 +53,6 @@ module.exports = {
       emailVerified: false,
       verificationToken: verificationToken || null,
       stripeCustomerId: null,
-      stripeSubscriptionItemId: null,
       createdAt: Date.now(),
     };
     data.vendors[vendorId] = record;
@@ -92,11 +91,10 @@ module.exports = {
   },
 
   // Stripe
-  setStripeIds(vendorId, stripeCustomerId, stripeSubscriptionItemId) {
+  setStripeIds(vendorId, stripeCustomerId) {
     const data = read();
     if (data.vendors[vendorId]) {
       data.vendors[vendorId].stripeCustomerId = stripeCustomerId;
-      data.vendors[vendorId].stripeSubscriptionItemId = stripeSubscriptionItemId;
       write(data);
     }
   },

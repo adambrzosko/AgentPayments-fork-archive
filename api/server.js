@@ -23,8 +23,15 @@
  *   SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
  *   PUBLIC_URL              optional — base URL for email links
  *   STRIPE_SECRET_KEY       optional — enables metered billing
- *   STRIPE_PRICE_ID         optional — Stripe metered price ID
+ *   STRIPE_PRICE_ID         optional — Stripe metered price ID (see stripe-billing.js)
+ *   STRIPE_METER_ID         optional — Stripe Billing Meter ID (see stripe-billing.js)
+ *   STRIPE_METER_EVENT_NAME optional — Stripe Billing Meter event name
  *   PORT                    optional — default 3001
+ *
+ * Rotating PLATFORM_MASTER_SECRET invalidates all existing dashboard sessions and any
+ * in-flight (unused) email-verification tokens immediately, but does NOT invalidate
+ * already-issued vendor api_key/verification_secret values — those are generated once
+ * at registration and stored verbatim, never re-derived from the current secret.
  */
 
 'use strict';
@@ -148,6 +155,17 @@ class RateLimiter {
 const registrationLimiter = new RateLimiter(60 * 60 * 1000, 5);
 // API endpoints: 120 per minute per IP
 const apiLimiter = new RateLimiter(60 * 1000, 120);
+// Dashboard login: 20 per minute per IP (credential-stuffing/DoS backstop)
+const loginLimiter = new RateLimiter(60 * 1000, 20);
+// Public key verification: high ceiling since this sees real vendor-server traffic,
+// but still bounded as a DoS backstop against garbage-key floods.
+const verifyLimiter = new RateLimiter(60 * 1000, 600);
+
+// NOTE: all limiters above are in-memory (per-process) and only enforce correctly on
+// a single instance. If this ever scales to multiple instances, each instance has its
+// own counters and the effective limit multiplies — swap in a shared backend (see
+// sdk/node/redis-store.js's RateLimiter for a reusable Redis-backed implementation)
+// at that point.
 
 function clientIp(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
@@ -158,8 +176,24 @@ function clientIp(req) {
 // ---------------------------------------------------------------------------
 
 const app = express();
+// Railway (and most PaaS hosts) terminate TLS and forward over HTTP internally via a
+// single reverse-proxy hop — trust proxy: 1 makes req.secure reflect X-Forwarded-Proto.
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: false })); // for dashboard login form + cookie parsing
+
+// Reject plaintext HTTP outside test/dev, mirroring the requireHttps pattern already
+// used in sdk/node/index.js.
+const requireHttps = process.env.NODE_ENV !== 'test' && process.env.NODE_ENV !== 'development';
+function isHttps(req) {
+  return req.secure || (req.headers['x-forwarded-proto'] || '').startsWith('https');
+}
+app.use((req, res, next) => {
+  if (requireHttps && !isHttps(req)) {
+    return res.status(400).json({ error: 'https_required', message: 'This service requires a secure HTTPS connection.' });
+  }
+  next();
+});
 
 // Simple cookie parser (no dependency)
 function getCookie(req, name) {
@@ -244,7 +278,7 @@ app.post('/v1/vendors/register', async (req, res, next) => {
     // Stripe: create customer + subscription (fire-and-forget errors)
     createCustomerAndSubscription(vendor.email, vendor.name)
       .then(async (ids) => {
-        if (ids) await store.setStripeIds(vendorId, ids.customerId, ids.subscriptionItemId);
+        if (ids) await store.setStripeIds(vendorId, ids.customerId);
       })
       .catch((err) => console.error(JSON.stringify({ level: 'error', component: 'stripe-setup', error: err.message })));
 
@@ -331,15 +365,16 @@ app.post('/v1/keys/issue', authenticate, async (req, res, next) => {
     const vendorId = v.vendor_id || v.vendorId;
     const key = issueAgentKey(vendorId, verSec);
 
-    // Increment counter (async, don't block response)
-    store.incrementKeysIssued(vendorId).catch((err) =>
+    // Increment counter (async, don't block response). Wrapped in Promise.resolve()
+    // since store-json.js's implementation is synchronous while store-pg.js's is async.
+    Promise.resolve(store.incrementKeysIssued(vendorId)).catch((err) =>
       console.error(JSON.stringify({ level: 'error', component: 'store', action: 'incrementKeysIssued', error: err.message })),
     );
 
     // Report to Stripe (fire-and-forget)
-    const subItemId = v.stripe_subscription_item_id || v.stripeSubscriptionItemId;
-    if (subItemId) {
-      recordKeyIssuance(subItemId).catch(() => {});
+    const customerId = v.stripe_customer_id || v.stripeCustomerId;
+    if (customerId) {
+      recordKeyIssuance(customerId).catch(() => {});
     }
 
     res.json({ key, issuedAt: Date.now(), type: 'platform_issued' });
@@ -356,10 +391,10 @@ app.get('/v1/usage', authenticate, async (req, res, next) => {
   try {
     const v = req.vendor;
     const vendorId = v.vendor_id || v.vendorId;
-    const subItemId = v.stripe_subscription_item_id || v.stripeSubscriptionItemId;
+    const customerId = v.stripe_customer_id || v.stripeCustomerId;
     const [thisMonth, stripeUsage] = await Promise.all([
       store.keysIssuedThisMonth(vendorId),
-      getCurrentUsage(subItemId),
+      getCurrentUsage(customerId),
     ]);
     res.json({
       vendorId,
@@ -379,6 +414,9 @@ app.get('/v1/usage', authenticate, async (req, res, next) => {
 
 app.post('/v1/keys/verify', async (req, res, next) => {
   try {
+    if (!verifyLimiter.check(clientIp(req))) {
+      return res.status(429).json({ error: 'rate_limited', message: 'Too many requests.' });
+    }
     const { key } = req.body || {};
     if (!key || typeof key !== 'string' || !key.startsWith('agp_')) {
       return res.status(400).json({ error: 'bad_request', message: 'key must be a platform-issued agp_ key.' });
@@ -421,7 +459,7 @@ app.get('/dashboard', async (req, res, next) => {
     const [thisMonth, dailyUsage, stripeUsage] = await Promise.all([
       store.keysIssuedThisMonth(vendorId),
       store.getDailyUsage(vendorId, 30),
-      getCurrentUsage(vendor.stripe_subscription_item_id || vendor.stripeSubscriptionItemId),
+      getCurrentUsage(vendor.stripe_customer_id || vendor.stripeCustomerId),
     ]);
 
     res.send(dashboardHtml(vendor, thisMonth, dailyUsage, stripeUsage));
@@ -432,6 +470,9 @@ app.get('/dashboard', async (req, res, next) => {
 
 app.post('/dashboard/login', async (req, res, next) => {
   try {
+    if (!loginLimiter.check(clientIp(req))) {
+      return res.send(loginHtml('Too many attempts. Please wait a minute and try again.'));
+    }
     const apiKey = (req.body?.key || '').trim();
     if (!apiKey) return res.send(loginHtml('Please enter your API key.'));
 
