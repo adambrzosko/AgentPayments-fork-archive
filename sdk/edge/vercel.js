@@ -6,6 +6,7 @@ export function createVercelEdgeGate(options = {}) {
   const {
     publicPathAllowlist = [],
     minPayment,
+    powDifficulty,
     env = {},
     upstreamNext,
     getClientIp,
@@ -18,6 +19,7 @@ export function createVercelEdgeGate(options = {}) {
   const gate = createEdgeGate({
     publicPathAllowlist,
     minPayment,
+    powDifficulty,
     getClientIp: ({ request }) =>
       (getClientIp ? getClientIp(request) : request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()) || 'unknown',
     fetchUpstream: (request) => upstreamNext(request),

@@ -31,9 +31,9 @@ test('catch-all serves index.html', async () => {
   assert.ok(res.headers['content-type'].includes('text/html'));
 });
 
-test('agent request without key gets 500 (no verify service configured)', async () => {
+test('agent request without key gets 402 with a fresh agent key', async () => {
   const res = await request(app).get('/api/data');
-  // No verify URL configured, so middleware returns 500
-  assert.equal(res.status, 500);
-  assert.equal(res.body.error, 'server_error');
+  assert.equal(res.status, 402);
+  assert.equal(res.body.error, 'payment_required');
+  assert.ok(res.body.your_key);
 });

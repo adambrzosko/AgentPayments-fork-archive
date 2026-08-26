@@ -1,7 +1,13 @@
 .env
 .venv*/
 __pycache__/
-jsons/.test-keypair.json
+# Wallet key files — never commit secret keys. Purge history with git-filter-repo
+# if any have already been committed (see ROADMAP P0 #7).
+jsons/
+
+# Platform API — local dev data file (contains API keys)
+api/vendors.json
+api/vendors.json.tmp
 
 # JS/Next build artifacts
 node_modules/
@@ -9,5 +15,15 @@ node_modules/
 .vercel/
 next_implementation/node_modules/
 next_implementation/.next/
-next_implementation/.vercel/llm_wallet_hub/data/db.json
+next_implementation/.vercel/
+llm_wallet_hub/data/db.json
 .vercel
+.wrangler/
+
+# Python packaging artifacts
+*.egg-info/
+sdk/python/dist/
+sdk/python/build/
+
+# npm packaging artifacts
+*.tgz

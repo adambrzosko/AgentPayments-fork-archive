@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  hmacSign, generateAgentKey, isValidAgentKey, derivePaymentMemo,
-  normalizeVerifyEndpoint, isPublicPath, isBrowser, getCookie, isValidCookie,
-  challengePage, jsonResponse,
+  hmacSign, generateAgentKey, isValidAgentKey,
+  isPublicPath, isBrowser, getCookie, isValidCookie,
+  challengePage, jsonResponse, clientIdForIp,
 } from '../index.js';
 
 const SECRET = 'test-secret-edge';
@@ -43,21 +43,6 @@ test('isValidAgentKey rejects empty/null/long', async () => {
   assert.equal(await isValidAgentKey('a'.repeat(200), SECRET), false);
 });
 
-test('derivePaymentMemo format and determinism', async () => {
-  const key = await generateAgentKey(SECRET);
-  const memo = await derivePaymentMemo(key, SECRET);
-  assert.match(memo, /^gm_[0-9a-f]{16}$/);
-  assert.equal(await derivePaymentMemo(key, SECRET), memo);
-});
-
-test('normalizeVerifyEndpoint', () => {
-  assert.equal(normalizeVerifyEndpoint('https://example.com/'), 'https://example.com/verify');
-  assert.equal(normalizeVerifyEndpoint('https://example.com///'), 'https://example.com/verify');
-  assert.equal(normalizeVerifyEndpoint('https://example.com/verify'), 'https://example.com/verify');
-  assert.equal(normalizeVerifyEndpoint(''), '');
-  assert.equal(normalizeVerifyEndpoint(null), '');
-});
-
 test('isPublicPath with default and custom allowlist', () => {
   assert.equal(isPublicPath('/robots.txt'), true);
   assert.equal(isPublicPath('/.well-known/foo'), true);
@@ -81,15 +66,17 @@ test('getCookie parses from Web Request', () => {
 });
 
 test('isValidCookie roundtrip', async () => {
+  const clientIp = '1.2.3.4';
   const now = Date.now().toString();
-  const sig = await hmacSign(now, SECRET);
+  const clientId = await clientIdForIp(clientIp, SECRET);
+  const sig = await hmacSign(`cookie:${now}:${clientId}`, SECRET);
   const req = new Request('https://x.com', { headers: { cookie: `__agp_verified=${now}.${sig}` } });
-  assert.equal(await isValidCookie(req, SECRET), true);
+  assert.equal(await isValidCookie(req, SECRET, clientIp), true);
 });
 
 test('isValidCookie rejects missing cookie', async () => {
   const req = new Request('https://x.com');
-  assert.equal(await isValidCookie(req, SECRET), false);
+  assert.equal(await isValidCookie(req, SECRET, '1.2.3.4'), false);
 });
 
 test('challengePage returns Response with HTML', async () => {

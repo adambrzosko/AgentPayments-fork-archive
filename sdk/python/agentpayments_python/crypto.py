@@ -4,13 +4,24 @@ import json
 import uuid
 from pathlib import Path
 
-_constants = json.loads((Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = json.loads((Path(__file__).resolve().parent / "constants.json").read_text())
 KEY_PREFIX = _constants["KEY_PREFIX"]
 MAX_KEY_LENGTH = _constants["MAX_KEY_LENGTH"]
 
 
 def hmac_sign(data: str, secret: str) -> str:
     return hmac.new(secret.encode(), data.encode(), hashlib.sha256).hexdigest()
+
+
+def sha256_hex(data: str) -> str:
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def client_id_for_ip(ip: str, secret: str) -> str:
+    """Short HMAC of the client IP. Used to bind nonces and cookies to the
+    client that solved the challenge, so a captured cookie is useless from
+    another IP."""
+    return hmac_sign(f"client:{ip}", secret)[:16]
 
 
 def generate_agent_key(secret: str) -> str:

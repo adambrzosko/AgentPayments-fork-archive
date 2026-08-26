@@ -1,5 +1,6 @@
 [build]
   publish = "."
+  command = "mkdir -p netlify/edge-functions/sdk && cp ../../sdk/edge/index.js ../../sdk/edge/netlify.js netlify/edge-functions/sdk/"
 
 [[edge_functions]]
   function = "gate"

@@ -1,14 +1,50 @@
 {
   "name": "@agentpayments/node",
   "version": "0.1.0",
-  "private": true,
+  "description": "AgentPayments gate middleware for Node.js / Express — charge AI agents USDC on Solana before they can access your API",
+  "license": "MIT",
   "main": "index.js",
   "types": "index.d.ts",
   "type": "commonjs",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js"
+    },
+    "./grant-store": "./grant-store.js",
+    "./redis-store": "./redis-store.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "grant-store.js",
+    "redis-store.js",
+    "constants.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "agentpayments",
+    "ai-agents",
+    "solana",
+    "usdc",
+    "payments",
+    "middleware",
+    "express",
+    "x402"
+  ],
   "scripts": {
     "test": "node --test"
   },
   "engines": {
     "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adambrzosko/AgentPayments.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

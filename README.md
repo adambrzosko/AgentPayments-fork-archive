@@ -1,103 +1,119 @@
 # AgentPayments
 
-Stripe-style goal: a website owner installs/imports one package, adds a few lines, and agent access is automatically gated behind payment.
+Stripe-style payment gate for web resources. Vendors install an SDK, add a few lines of code, and their site is protected: browsers pass a JavaScript challenge, AI agents pay with Solana USDC.
+
+## Quick Start
+
+Pick your runtime and add the gate in under 5 lines:
+
+**Node/Express**
+```js
+const { agentPaymentsGate } = require('@agentpayments/node');
+app.use(agentPaymentsGate({
+  challengeSecret: process.env.CHALLENGE_SECRET,
+  homeWalletAddress: process.env.HOME_WALLET_ADDRESS,
+}));
+```
+
+**Next.js** (`middleware.ts`)
+```ts
+import { createNextMiddleware } from '@agentpayments/next';
+export default createNextMiddleware();
+export const config = { matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'] };
+```
+
+**Cloudflare Workers**
+```js
+import { createAgentPaymentsWorker } from '@agentpayments/edge/cloudflare';
+export default createAgentPaymentsWorker({ assetsBinding: 'ASSETS' });
+```
+
+**Django** (`settings.py`)
+```python
+MIDDLEWARE = [
+    "agentpayments_python.django_adapter.GateMiddleware",
+    # ...
+]
+```
+
+**FastAPI / Flask** — see [Python SDK README](sdk/python/README.md).
+
+## How It Works
+
+1. **Browser visitors** receive a transparent JavaScript challenge page (canvas fingerprint + nonce). If they pass, a signed cookie grants access for 24 hours.
+2. **API clients (agents)** without a browser get a `402 Payment Required` response containing a generated agent key. They send a USDC payment on Solana with the key as the transaction memo, then include `X-Agent-Key: <key>` on subsequent requests.
+3. **Public paths** (`/robots.txt`, `/.well-known/*`) bypass the gate entirely.
+
+See [API Reference](API_REFERENCE.md) for full request/response details.
 
 ## Architecture
-- Core gate behavior lives in `sdk/` (shared, package-style code).
-- Deployment folders are thin wrappers only (minimal wiring and config).
-- Verification is done by `verify_service/` (not by deployment wrappers).
-- `verify_service` and `llm_wallet_hub` are entirely separate services with separate UIs/deployments.
-- `llm_wallet_hub/` is separate software for user wallets and tool-based payments.
 
-## Public URLs
+```
+sdk/                          Shared gate logic (source of truth)
+  constants.json              Centralized Solana addresses, limits, config
+  node/                       @agentpayments/node  (Express middleware, CommonJS)
+  edge/                       @agentpayments/edge  (Cloudflare/Netlify/Vercel, ESM)
+  next/                       @agentpayments/next  (Next.js middleware wrapper)
+  python/                     agentpayments-python  (Django/FastAPI/Flask adapters)
 
-### Gated website demos
-- Edge (Cloudflare Worker): https://agentpayments-cloudflare.matthew-newell.workers.dev - FULLY WORKING
-- Python (Django, Oracle VM): https://clankertax.tearsheet.one - FULLY WORKING
-- Node (Express behind nginx path): https://clankertax.tearsheet.one/node/ - FULLY WORKING
-- Next.js (Vercel alias): https://nextjsdeployment-five.vercel.app - FULLY WORKING
+node_implementation/          Express demo (thin wrapper)
+next_implementation/          Next.js demo (thin wrapper)
+edge_implementation/
+  cloudflare_worker/          Cloudflare Worker demo
+  netlify/                    Netlify Edge demo
+python_implementation/
+  django/                     Django demo
+scripts/                      Utility and demo scripts
+```
 
+**Rule:** deployment folders stay thin. Core gate behavior belongs in `sdk/` packages.
 
-- Next.js (direct Vercel deployment): https://nextjsdeployment-h3sqvhkx0-matt-newells-projects.vercel.app
-- Node direct subdomain (if DNS active): https://node.clankertax.tearsheet.one
-- Django direct IP HTTP: http://140.238.68.134
+## SDK Roadmap
 
-### Verify Service
-- Verify service UI/base URL: https://verifyservice-omega.vercel.app
-- Verify endpoint used by SDKs: `https://verifyservice-omega.vercel.app/verify`
-- Merchant signup endpoint: `https://verifyservice-omega.vercel.app/merchants/signup`
-- Merchant metadata endpoint: `https://verifyservice-omega.vercel.app/merchants/me`
+1. :white_check_mark: `@agentpayments/node` — Express middleware (CommonJS + TypeScript types)
+2. :white_check_mark: `@agentpayments/edge` — Fetch-runtime gate with Cloudflare, Netlify, and Vercel adapters (ESM + TypeScript types)
+3. :white_check_mark: `agentpayments-python` — Django, FastAPI, and Flask adapters
+4. :white_check_mark: `@agentpayments/next` — First-class Next.js middleware wrapper
+5. :hourglass_flowing_sand: Proxy adapter (Nginx/Envoy style enforcement)
 
-### Wallet Hub
-- Wallet hub UI/API (LLM wallet hub deployment): https://llmwallethub.vercel.app
+## Security Features
 
-### On-chain wallet and network
-- Current configured recipient wallet address: `2UhakLCBSPgWyoVmTCqJ9fgtnXzW9SPeLTyJ5QsT79GF`
-- Solana network: mainnet (via Helius RPC)
-- Token: USDC SPL token (network-specific mint handled by verifier)
+All SDKs share the same security posture:
 
-## Verification flow (agent request to on-chain confirmation)
-1. Agent request hits a protected route without `X-Agent-Key`.
-2. Gate returns HTTP `402 payment_required` with:
-   - a newly generated key (`ag_...`)
-   - payment instructions
-   - deterministic memo (`gm_...`) derived from that key
-3. Agent sends USDC on Solana with that memo.
-4. Agent retries with `X-Agent-Key: <ag_key>`.
-5. Gate calls verify backend `GET /verify?memo=<gm_...>` with merchant Bearer key.
-6. Verify backend checks cache table `verified_payments`.
-7. If not cached, verify backend scans recent Solana transactions for:
-   - matching memo
-   - USDC transfer meeting minimum amount
-   - recipient wallet match
-8. On match, backend stores verification and returns `{ "paid": true }`.
-9. Gate caches paid status and allows upstream request.
+- **Timing-safe comparison** for all HMAC checks (agent keys, cookies, nonce signatures)
+- **Payment verification caching** — 10-minute TTL, 1000-entry max, avoids redundant RPC calls
+- **Rate limiting** — 20 challenge verifications per minute per IP
+- **Input size limits** — agent key (64), nonce (128), return URL (2048), fingerprint (128)
+- **Wallet address validation** — base58 format, 32-44 characters, checked at init
+- **Default secret detection** — warns in debug mode, throws/500s in production
+- **Structured JSON logging** (Node/Edge SDKs)
 
-## Website onboarding flow (merchant)
-1. Merchant opens verify service signup page (served by `verify_service/public/index.html`).
-2. Merchant submits site name/URL to `POST /merchants/signup`.
-3. Verify service returns a per-merchant API key.
-4. Merchant adds env vars to their site:
-   - `CHALLENGE_SECRET=<strong-random-secret>`
-   - `AGENTPAYMENTS_VERIFY_URL=<VERIFY_BASE_URL>/verify` (or base URL; SDK appends `/verify`)
-   - `AGENTPAYMENTS_API_KEY=<merchant-api-key>`
-5. Merchant installs and wires the platform package:
-   - Node/Express: `@agentpayments/node`
-   - Edge runtimes: `@agentpayments/edge`
-   - Python: `agentpayments-python`
-   - Next.js middleware: `@agentpayments/next`
-6. Site deploys with gate middleware enabled.
-7. First agent request receives payment instructions automatically.
-8. After payment confirms, same key unlocks future requests (subject to cache TTL and policy).
+See [SECURITY.md](SECURITY.md) for the full threat model.
 
-## Project layout
-- `sdk/node/`: Implementation #1 (`@agentpayments/node`)
-- `sdk/edge/`: Implementation #2 (`@agentpayments/edge`)
-- `sdk/python/`: Implementation #3 (`agentpayments-python`)
-- `sdk/next/`: Implementation #4 (`@agentpayments/next`)
-- `verify_service/`: verification backend, merchant API key issuance, on-chain scanning
-- `llm_wallet_hub/`: separate wallet platform and tool-payment API
-- `node_implementation/`: thin Express demo wrapper
-- `next_implementation/`: thin Next.js demo wrapper
-- `edge_implementation/cloudflare_worker/`: thin Cloudflare wrapper
-- `edge_implementation/netlify/`: thin Netlify wrapper
-- `python_implementation/django/`: thin Django wrapper
+## Environment Variables
 
-## SDK roadmap
-1. `@agentpayments/node` complete
-2. `@agentpayments/edge` complete
-3. `agentpayments-python` complete
-4. `@agentpayments/next` complete
-5. Proxy adapter (Nginx/Envoy style) next
+| Variable | Required | Description |
+|---|---|---|
+| `CHALLENGE_SECRET` | Yes (production) | HMAC secret for signing cookies, nonces, and agent keys. Must be unique and strong. |
+| `HOME_WALLET_ADDRESS` | Yes | Solana wallet address to receive USDC payments. |
+| `SOLANA_RPC_URL` | No | Custom Solana RPC endpoint. Defaults to devnet/mainnet based on `DEBUG`. |
+| `USDC_MINT` | No | Custom USDC mint address. Defaults to devnet/mainnet based on `DEBUG`. |
+| `DEBUG` | No | Set to `"false"` for production (mainnet). Defaults to `true` (devnet). |
 
-## Deployment notes
-- Django Oracle deployment doc: `python_implementation/django/DEPLOY_ORACLE.md`
-- Keep deployment wrappers thin; move behavior changes into `sdk/`.
-- Never commit secrets or private keys.
+## Public Demo URLs
 
-## Important files
-- `verify_service/app.js`: verification API and merchant endpoints
-- `verify_service/chain.js`: on-chain Solana USDC memo verification logic
-- `sdk/node/index.js`: Node middleware gate logic
-- `sdk/edge/index.js`: shared edge gate logic used by Cloudflare/Netlify/Vercel/Next wrapper
-- `sdk/next/index.js`: Next middleware adapter over edge gate
+- **Cloudflare Worker**: https://agentpayments-cloudflare.matthew-newell.workers.dev
+- **Django (Oracle VM)**: https://clankertax.tearsheet.one
+- **Next.js (Vercel)**: https://nextjsdeployment-five.vercel.app
+
+## JSON Files
+
+- `.test-keypair.json`: Local devnet Solana keypair used by test scripts. Safe to delete; scripts will recreate it.
+- `bot-wallet.json`: Wallet data used by the bot visitor script.
+- `wallet-keys.json`: Generated wallet keys used by local scripts.
+- `edge_implementation/netlify/.well-known/agent-access.json`: Public discovery file for Netlify demo.
+- `python_implementation/django/.well-known/agent-access.json`: Public discovery file for Django demo.
+
+## Django (Oracle VM)
+
+For Oracle Always Free VM deployment, see `python_implementation/django/DEPLOY_ORACLE.md`.

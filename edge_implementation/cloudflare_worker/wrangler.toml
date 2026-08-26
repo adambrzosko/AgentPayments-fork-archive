@@ -7,9 +7,23 @@ directory = "./public"
 binding = "ASSETS"
 run_worker_first = true
 
+# KV namespace for cross-isolate state: nonce replay prevention, rate limiting,
+# payment cache. Create the namespace once then paste the ID below:
+#   wrangler kv:namespace create AGENTPAYMENTS_KV
+# For local dev (`wrangler dev`), the binding is optional — the worker falls
+# back to per-isolate in-memory state automatically when AGENTPAYMENTS_KV is absent.
+#
+# Uncomment and fill in the real ID before deploying to production:
+# [[kv_namespaces]]
+# binding = "AGENTPAYMENTS_KV"
+# id = "REPLACE_WITH_OUTPUT_OF_wrangler_kv_namespace_create"
+
 [vars]
-# Verification service (standalone, not llm_wallet_hub)
-AGENTPAYMENTS_VERIFY_URL = "https://your-verify-service.example.com/verify"
+DEBUG = "true"
+HOME_WALLET_ADDRESS = "5rXZeAEbg13DQnSFijEno2hKEJLK2p14fAo3AmPtfBft"
 # Set these in production via `wrangler secret put` / dashboard:
 # CHALLENGE_SECRET
-# AGENTPAYMENTS_API_KEY (per-merchant API key from verify service)
+# HOME_WALLET_ADDRESS
+# SOLANA_RPC_URL
+# USDC_MINT
+# AGENTPAYMENTS_API_KEY (optional — enables hosted key issuance via api.agentpayments.dev)

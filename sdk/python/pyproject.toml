@@ -5,17 +5,44 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentpayments-python"
 version = "0.1.0"
-description = "AgentPayments middleware/adapters for Python web frameworks"
+description = "AgentPayments gate for Python web frameworks — charge AI agents USDC on Solana before they can access your API"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
+keywords = ["agentpayments", "ai-agents", "solana", "usdc", "payments", "middleware", "x402"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: WWW/HTTP :: WSGI :: Middleware",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
   "requests>=2.31",
 ]
 
 [project.optional-dependencies]
-django = ["Django>=5.0"]
+django  = ["Django>=5.0"]
 fastapi = ["fastapi>=0.110", "starlette>=0.37"]
-flask = ["flask>=3.0"]
+flask   = ["flask>=3.0"]
+all     = ["Django>=5.0", "fastapi>=0.110", "starlette>=0.37", "flask>=3.0"]
+
+[project.urls]
+Homepage      = "https://github.com/adambrzosko/AgentPayments"
+Documentation = "https://github.com/adambrzosko/AgentPayments/tree/main/sdk/python"
+Repository    = "https://github.com/adambrzosko/AgentPayments"
+"Bug Tracker" = "https://github.com/adambrzosko/AgentPayments/issues"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where   = ["."]
 include = ["agentpayments_python*"]
+
+[tool.setuptools.package-data]
+agentpayments_python = ["constants.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,50 +1,73 @@
 # AGENTS.md
 
-## Scope
-This file defines how coding agents should work in this repository.
+Instructions for **any** coding agent (Claude, Copilot, Cursor, etc.) working in this repository.
 
-## Product Direction (non-negotiable)
-- We are building a Stripe-style integration:
-  - install/import package
-  - add a couple of lines
-  - bot/payment gate works
-- Keep core bot-blocking/payment logic out of deployment folders.
-- Put shared logic in central package-style code (`sdk/` for now).
-- Deployment folders should be thin adapters/wrappers only.
+For Claude-specific instructions, see [CLAUDE.md](CLAUDE.md).
+For human contributors, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Product Direction (Non-Negotiable)
+
+We are building a **Stripe-style integration**:
+1. Install/import the AgentPayments package
+2. Add a couple of lines of code
+3. Bot-blocking + payment gate works
+
+Therefore:
+- **Shared gate logic belongs in `sdk/`.** This is the source of truth.
+- **Deployment folders are thin wrappers only.** They contain integration glue, config, and demo assets — not gate logic.
+- Do not duplicate or fork core gate logic into deployment folders unless explicitly asked.
 
 ## Project Layout
-- `sdk/`: Shared gate logic intended to become publishable libraries.
-  - `sdk/node/`: **Implementation #1 (done)**, Express-first package (`@agentpayments/node`).
-  - `sdk/edge/`: **Implementation #2 (done)**, fetch-runtime package (`@agentpayments/edge`) with Cloudflare/Netlify/Vercel adapters.
-  - `sdk/python/`: **Implementation #3 (done)**, python package (`agentpayments-python`) with Django/FastAPI/Flask adapters.
-  - `sdk/next/`: **Implementation #4 (done)**, Next.js wrapper package (`@agentpayments/next`).
-  - Next target: proxy adapter.
-- `python_implementation/django/`: Django integration demo (thin wrapper).
-- `edge_implementation/netlify/`: Static + Netlify edge deployment demo (thin wrapper).
-- `edge_implementation/cloudflare_worker/`: Cloudflare Worker integration demo (thin wrapper).
-- `node_implementation/`: Node/Express integration demo (thin wrapper).
-- `scripts/`: Utility and demo scripts.
+
+```
+sdk/                              Source of truth for gate behavior
+  constants.json                  Centralized constants (Solana addresses, limits)
+  node/                           @agentpayments/node  (Express, CommonJS)
+  edge/                           @agentpayments/edge  (Cloudflare/Netlify/Vercel, ESM)
+  next/                           @agentpayments/next  (Next.js middleware wrapper)
+  python/                         agentpayments-python  (Django/FastAPI/Flask)
+
+node_implementation/              Express demo (thin wrapper)
+next_implementation/              Next.js demo (thin wrapper)
+edge_implementation/cloudflare_worker/   Cloudflare Worker demo
+edge_implementation/netlify/             Netlify Edge demo
+python_implementation/django/            Django demo
+scripts/                          Utility and demo scripts
+```
 
 ## Working Rules
-- Make minimal, targeted changes.
-- Prefer editing shared logic in `sdk/` when behavior changes are cross-platform.
-- In deployment folders, avoid copying core gate logic; keep wiring/config concise.
-- Do not move or delete deployment folders without explicit instruction.
-- Never commit secrets or private keys.
-- Keep edits ASCII unless file already requires Unicode.
-- Preserve existing style and naming.
+
+1. Make minimal, targeted changes. Avoid unrelated refactors.
+2. Prefer editing shared logic in `sdk/` when behavior changes are cross-platform.
+3. In deployment folders, keep wiring concise — don't copy core gate logic.
+4. Constants go in `sdk/constants.json`, not hardcoded in individual SDKs.
+5. Do not move or delete deployment folders without explicit instruction.
+6. Never commit secrets or private keys.
+7. Keep edits ASCII unless the file already requires Unicode.
+8. Preserve existing code style and naming conventions.
+
+## Cross-Runtime Parity
+
+When changing gate behavior, check whether the same change applies across:
+- Node SDK (`sdk/node/index.js`)
+- Edge SDK (`sdk/edge/index.js`)
+- Python SDK (`sdk/python/agentpayments_python/`)
+
+All SDKs should maintain the same security posture and response formats. See [SECURITY.md](SECURITY.md) and [API_REFERENCE.md](API_REFERENCE.md).
 
 ## Validation
-- For Django changes, run:
-  - `python python_implementation/django/manage.py check`
-- For Cloudflare changes, run:
-  - `npx wrangler deploy` from `edge_implementation/cloudflare_worker/` when requested
-- For script changes, run only the affected script with safe/local settings.
-- If tests are added later, run the smallest relevant subset first.
+
+| Change area | Command |
+|---|---|
+| Node SDK | `node -e "require('./sdk/node/index.js')"` |
+| Edge/Cloudflare | `npx wrangler deploy` from `edge_implementation/cloudflare_worker/` |
+| Python syntax | `python3 -c "import ast; ast.parse(open(f).read())"` for each changed file |
+| Django | `python manage.py check` from `python_implementation/django/` (requires venv) |
 
 ## Change Notes
-- In PR or handoff summaries, include:
-  - What changed
-  - Why it changed
-  - What was run to validate
-  - Any remaining risks or follow-ups
+
+In PR or handoff summaries, include:
+- What changed
+- Why it changed
+- What was run to validate
+- Any remaining risks or follow-ups

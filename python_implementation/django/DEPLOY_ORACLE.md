@@ -41,8 +41,10 @@ Edit `python_implementation/django/.env`:
 ```dotenv
 DJANGO_SECRET_KEY=<strong-random-secret>
 CHALLENGE_SECRET=<strong-random-secret>
-AGENTPAYMENTS_VERIFY_URL=https://your-verify-service.example.com/verify
-AGENTPAYMENTS_API_KEY=<your-api-key>
+HOME_WALLET_ADDRESS=<your-solana-wallet-address>
+SOLANA_RPC_URL=<optional-custom-rpc-url>
+USDC_MINT=<optional-custom-usdc-mint>
+AGENTPAYMENTS_API_KEY=<optional-hosted-issuance-api-key>
 ALLOWED_HOSTS=<your-domain-or-public-ip>
 CSRF_TRUSTED_ORIGINS=http://<your-domain-or-public-ip>
 ```

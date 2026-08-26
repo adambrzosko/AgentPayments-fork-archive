@@ -1,0 +1,4 @@
+# SDK files are copied here at build time by the netlify.toml build command.
+# Do not commit these files — they are generated artifacts.
+*
+!.gitignore
