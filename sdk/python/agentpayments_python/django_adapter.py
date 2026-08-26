@@ -12,7 +12,7 @@ from .detection import is_browser_from_headers, is_public_path
 from .ratelimit import _challenge_limiter, _agent_key_limiter, _challenge_issue_limiter
 from .crawler import is_verified_crawler
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
-from .x402 import build_payment_requirements, enrich_402_body, payment_required_header
+from .x402 import build_payment_object, build_payment_requirements, enrich_402_body, payment_required_header
 from .platform_client import HOSTED_KEY_PREFIX, PlatformClient, is_valid_hosted_key
 
 import json as _json
@@ -105,6 +105,16 @@ class GateMiddleware:
         }
         if not is_browser_from_headers(headers):
             agent_key = request.META.get("HTTP_X_AGENT_KEY")
+
+            # Resolve the on-chain platform fee requirement once (hosted-platform
+            # mode only — always None for self-hosted vendors with no platform client).
+            fee_info = None
+            if self._platform_client:
+                try:
+                    fee_info = self._platform_client.get_platform_fee_info()
+                except Exception as exc:
+                    logger.warning("Failed to fetch platform fee info, proceeding without fee enforcement: %s", exc)
+
             if not agent_key:
                 # Hosted mode: issue metered platform key (agp_).
                 # Local mode: generate self-signed key (ag_).
@@ -116,20 +126,20 @@ class GateMiddleware:
                         new_key = generate_agent_key(secret)
                 else:
                     new_key = generate_agent_key(secret)
+                if fee_info:
+                    no_key_instructions = (
+                        f'Send {MIN_PAYMENT} USDC on Solana {network} to {wallet_address} with memo "{new_key}", '
+                        f'AND in the SAME transaction send the platform fee (see platform_fee below) to {fee_info["wallet"]}. '
+                        f'Then include the header X-Agent-Key: {new_key} on all subsequent requests.'
+                    )
+                else:
+                    no_key_instructions = f'Send {MIN_PAYMENT} USDC on Solana {network} to {wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.'
                 return _payment_required_response(
                     {
                         "error": "payment_required",
                         "message": "Access requires a paid API key. A key has been generated for you below. Send a USDC payment on Solana with this key as the memo to activate it, then retry your request with the X-Agent-Key header.",
                         "your_key": new_key,
-                        "payment": {
-                            "chain": "solana",
-                            "network": network,
-                            "token": "USDC",
-                            "amount": str(MIN_PAYMENT),
-                            "wallet_address": wallet_address,
-                            "memo": new_key,
-                            "instructions": f'Send {MIN_PAYMENT} USDC on Solana {network} to {wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.',
-                        },
+                        "payment": build_payment_object(network=network, min_payment=MIN_PAYMENT, wallet_address=wallet_address, memo=new_key, fee_info=fee_info, instructions=no_key_instructions),
                     },
                     wallet_address=wallet_address, mint=self.usdc_mint, min_payment=MIN_PAYMENT,
                     debug=self.debug, agent_key=new_key, resource=pathname,
@@ -160,7 +170,7 @@ class GateMiddleware:
             if self.grant_store and self.grant_store.has(agent_key):
                 return self.get_response(request)
 
-            paid = verify_payment_on_chain(agent_key, wallet_address, self.rpc_url, self.usdc_mint)
+            paid = verify_payment_on_chain(agent_key, wallet_address, self.rpc_url, self.usdc_mint, fee_info=fee_info)
             if paid and self.grant_store:
                 self.grant_store.add(agent_key)
             if not paid:
@@ -169,14 +179,7 @@ class GateMiddleware:
                         "error": "payment_required",
                         "message": "Key is valid but payment has not been verified on-chain yet.",
                         "your_key": agent_key,
-                        "payment": {
-                            "chain": "solana",
-                            "network": network,
-                            "token": "USDC",
-                            "amount": str(MIN_PAYMENT),
-                            "wallet_address": wallet_address,
-                            "memo": agent_key,
-                        },
+                        "payment": build_payment_object(network=network, min_payment=MIN_PAYMENT, wallet_address=wallet_address, memo=agent_key, fee_info=fee_info),
                     },
                     wallet_address=wallet_address, mint=self.usdc_mint, min_payment=MIN_PAYMENT,
                     debug=self.debug, agent_key=agent_key, resource=pathname,

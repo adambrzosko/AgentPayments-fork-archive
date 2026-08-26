@@ -7,6 +7,8 @@ requirements from our 402 responses.
 
 Spec: https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md
 """
+from __future__ import annotations
+
 import base64
 import json as _json
 import math
@@ -62,6 +64,48 @@ def build_payment_requirements(
     if resource:
         req["resource"] = resource
     return req
+
+
+def build_payment_object(
+    *,
+    network: str,
+    min_payment: float,
+    wallet_address: str,
+    memo: str,
+    fee_info: dict | None = None,
+    instructions: str = "",
+) -> dict:
+    """
+    Build the custom `payment` dict for a 402 body — NOT part of the x402 spec
+    (that's build_payment_requirements above, which stays vendor-leg-only). When
+    fee_info is set (hosted-platform mode with an on-chain fee configured), adds
+    a platform_fee field describing the second required transfer. Deliberately
+    not added as a second x402 accepts[] entry — that would read to a
+    spec-compliant client as an alternative payment method, not an additional
+    requirement.
+
+    fee_info: {"wallet": str, "rate_pct": float} or None.
+    """
+    payment: dict = {
+        "chain": "solana",
+        "network": network,
+        "token": "USDC",
+        "amount": str(min_payment),
+        "wallet_address": wallet_address,
+        "memo": memo,
+    }
+    if fee_info:
+        fee_amount_micro = round(round(min_payment * 1_000_000) * fee_info["rate_pct"] / 100)
+        payment["platform_fee"] = {
+            "wallet_address": fee_info["wallet"],
+            "amount": str(fee_amount_micro / 1_000_000),
+            "token": "USDC",
+            "rate_pct": fee_info["rate_pct"],
+            "note": "Must be a second USDC transfer inside the SAME Solana transaction as the payment above, or access will be denied.",
+        }
+    if instructions:
+        payment["instructions"] = instructions
+    return payment
 
 
 def payment_required_header(payment_requirements: dict) -> str:

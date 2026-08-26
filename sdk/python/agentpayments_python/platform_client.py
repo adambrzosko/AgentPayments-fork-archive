@@ -63,7 +63,10 @@ class PlatformClient:
 
     def __init__(self, api_key: str, platform_url: str = PLATFORM_API_URL) -> None:
         self.api_key = api_key
-        self.platform_url = platform_url.rstrip("/")
+        # Callers (django/fastapi/flask adapters) often pass platform_url=None
+        # explicitly when no override was configured, which bypasses this
+        # parameter's own default — fall back to PLATFORM_API_URL here too.
+        self.platform_url = (platform_url or PLATFORM_API_URL).rstrip("/")
         self._verification_secret: str | None = None
         self._platform_fee_info: dict | None = None
         self._account_fetched = False

@@ -11,7 +11,7 @@ from .detection import is_browser_from_headers, is_public_path
 from .ratelimit import _challenge_limiter, _agent_key_limiter, _challenge_issue_limiter
 from .crawler import is_verified_crawler
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
-from .x402 import build_payment_requirements, enrich_402_body, payment_required_header
+from .x402 import build_payment_object, build_payment_requirements, enrich_402_body, payment_required_header
 from .platform_client import HOSTED_KEY_PREFIX, PlatformClient, is_valid_hosted_key
 
 import json as _json
@@ -88,6 +88,18 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
         if not is_browser_from_headers(dict(request.headers)):
             agent_key = request.headers.get("x-agent-key")
             network = "devnet" if self.debug else "mainnet-beta"
+            loop = asyncio.get_event_loop()
+
+            # Resolve the on-chain platform fee requirement once (hosted-platform
+            # mode only — always None for self-hosted vendors with no platform client).
+            fee_info = None
+            if self._platform_client:
+                try:
+                    fee_info = await loop.run_in_executor(None, self._platform_client.get_platform_fee_info)
+                except Exception as exc:
+                    import logging as _log
+                    _log.getLogger("agentpayments").warning("Failed to fetch platform fee info, proceeding without fee enforcement: %s", exc)
+
             if not agent_key:
                 if self._platform_client:
                     try:
@@ -98,20 +110,20 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
                         new_key = generate_agent_key(self.challenge_secret)
                 else:
                     new_key = generate_agent_key(self.challenge_secret)
+                if fee_info:
+                    no_key_instructions = (
+                        f'Send {MIN_PAYMENT} USDC on Solana {network} to {self.home_wallet_address} with memo "{new_key}", '
+                        f'AND in the SAME transaction send the platform fee (see platform_fee below) to {fee_info["wallet"]}. '
+                        f'Then include the header X-Agent-Key: {new_key} on all subsequent requests.'
+                    )
+                else:
+                    no_key_instructions = f'Send {MIN_PAYMENT} USDC on Solana {network} to {self.home_wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.'
                 return _payment_required_response(
                     {
                         "error": "payment_required",
                         "message": "Access requires a paid API key. A key has been generated for you below. Send a USDC payment on Solana with this key as the memo to activate it, then retry your request with the X-Agent-Key header.",
                         "your_key": new_key,
-                        "payment": {
-                            "chain": "solana",
-                            "network": network,
-                            "token": "USDC",
-                            "amount": str(MIN_PAYMENT),
-                            "wallet_address": self.home_wallet_address,
-                            "memo": new_key,
-                            "instructions": f'Send {MIN_PAYMENT} USDC on Solana {network} to {self.home_wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.',
-                        },
+                        "payment": build_payment_object(network=network, min_payment=MIN_PAYMENT, wallet_address=self.home_wallet_address, memo=new_key, fee_info=fee_info, instructions=no_key_instructions),
                     },
                     wallet_address=self.home_wallet_address, mint=self.usdc_mint, min_payment=MIN_PAYMENT,
                     debug=self.debug, agent_key=new_key, resource=path,
@@ -143,9 +155,8 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
 
             # verify_payment_on_chain is synchronous (uses requests). Run it in a
             # thread-pool executor so it doesn't block the async event loop.
-            loop = asyncio.get_event_loop()
             paid = await loop.run_in_executor(
-                None, verify_payment_on_chain, agent_key, self.home_wallet_address, self.solana_rpc_url, self.usdc_mint
+                None, lambda: verify_payment_on_chain(agent_key, self.home_wallet_address, self.solana_rpc_url, self.usdc_mint, fee_info=fee_info)
             )
             if paid and self.grant_store:
                 self.grant_store.add(agent_key)
@@ -155,7 +166,7 @@ class AgentPaymentsASGIMiddleware(BaseHTTPMiddleware):
                         "error": "payment_required",
                         "message": "Key is valid but payment has not been verified on-chain yet.",
                         "your_key": agent_key,
-                        "payment": {"chain": "solana", "network": network, "token": "USDC", "amount": str(MIN_PAYMENT), "wallet_address": self.home_wallet_address, "memo": agent_key},
+                        "payment": build_payment_object(network=network, min_payment=MIN_PAYMENT, wallet_address=self.home_wallet_address, memo=agent_key, fee_info=fee_info),
                     },
                     wallet_address=self.home_wallet_address, mint=self.usdc_mint, min_payment=MIN_PAYMENT,
                     debug=self.debug, agent_key=agent_key, resource=path,

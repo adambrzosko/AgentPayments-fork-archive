@@ -8,7 +8,7 @@ from .detection import is_browser_from_headers, is_public_path
 from .ratelimit import _challenge_limiter, _agent_key_limiter, _challenge_issue_limiter
 from .crawler import is_verified_crawler
 from .solana import MIN_PAYMENT, RPC_DEVNET, RPC_MAINNET, USDC_MINT_DEVNET, USDC_MINT_MAINNET, is_valid_solana_address, verify_payment_on_chain
-from .x402 import build_payment_requirements, enrich_402_body, payment_required_header
+from .x402 import build_payment_object, build_payment_requirements, enrich_402_body, payment_required_header
 from .platform_client import HOSTED_KEY_PREFIX, PlatformClient, is_valid_hosted_key
 
 import json as _json
@@ -71,6 +71,17 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
         if not is_browser_from_headers(request.headers):
             key = request.headers.get("X-Agent-Key")
             network = "devnet" if debug else "mainnet-beta"
+
+            # Resolve the on-chain platform fee requirement once (hosted-platform
+            # mode only — always None for self-hosted vendors with no platform client).
+            fee_info = None
+            if _platform_client:
+                try:
+                    fee_info = _platform_client.get_platform_fee_info()
+                except Exception as exc:
+                    import logging as _log
+                    _log.getLogger("agentpayments").warning("Failed to fetch platform fee info, proceeding without fee enforcement: %s", exc)
+
             if not key:
                 if _platform_client:
                     try:
@@ -81,20 +92,20 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
                         new_key = generate_agent_key(challenge_secret)
                 else:
                     new_key = generate_agent_key(challenge_secret)
+                if fee_info:
+                    no_key_instructions = (
+                        f'Send {MIN_PAYMENT} USDC on Solana {network} to {home_wallet_address} with memo "{new_key}", '
+                        f'AND in the SAME transaction send the platform fee (see platform_fee below) to {fee_info["wallet"]}. '
+                        f'Then include the header X-Agent-Key: {new_key} on all subsequent requests.'
+                    )
+                else:
+                    no_key_instructions = f'Send {MIN_PAYMENT} USDC on Solana {network} to {home_wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.'
                 return _payment_required_flask(
                     {
                         "error": "payment_required",
                         "message": "Access requires a paid API key. A key has been generated for you below. Send a USDC payment on Solana with this key as the memo to activate it, then retry your request with the X-Agent-Key header.",
                         "your_key": new_key,
-                        "payment": {
-                            "chain": "solana",
-                            "network": network,
-                            "token": "USDC",
-                            "amount": str(MIN_PAYMENT),
-                            "wallet_address": home_wallet_address,
-                            "memo": new_key,
-                            "instructions": f'Send {MIN_PAYMENT} USDC on Solana {network} to {home_wallet_address} with memo "{new_key}". Then include the header X-Agent-Key: {new_key} on all subsequent requests.',
-                        },
+                        "payment": build_payment_object(network=network, min_payment=MIN_PAYMENT, wallet_address=home_wallet_address, memo=new_key, fee_info=fee_info, instructions=no_key_instructions),
                     },
                     wallet_address=home_wallet_address, mint=mint, min_payment=MIN_PAYMENT,
                     debug=debug, agent_key=new_key, resource=path,
@@ -118,7 +129,7 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
                 return jsonify({"error": "server_error", "message": "Payment verification unavailable."}), 500
             if grant_store and grant_store.has(key):
                 return None
-            paid = verify_payment_on_chain(key, home_wallet_address, rpc_url, mint)
+            paid = verify_payment_on_chain(key, home_wallet_address, rpc_url, mint, fee_info=fee_info)
             if paid and grant_store:
                 grant_store.add(key)
             if not paid:
@@ -127,7 +138,7 @@ def register_agentpayments(app, *, challenge_secret: str, home_wallet_address: s
                         "error": "payment_required",
                         "message": "Key is valid but payment has not been verified on-chain yet.",
                         "your_key": key,
-                        "payment": {"chain": "solana", "network": network, "token": "USDC", "amount": str(MIN_PAYMENT), "wallet_address": home_wallet_address, "memo": key},
+                        "payment": build_payment_object(network=network, min_payment=MIN_PAYMENT, wallet_address=home_wallet_address, memo=key, fee_info=fee_info),
                     },
                     wallet_address=home_wallet_address, mint=mint, min_payment=MIN_PAYMENT,
                     debug=debug, agent_key=key, resource=path,
