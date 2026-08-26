@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "db:migrate": "psql $DATABASE_URL -f schema.sql",
+    "db:migrate": "node migrate.js",
     "test": "node --test"
   },
   "dependencies": {
