@@ -19,6 +19,7 @@
     "index.d.ts",
     "grant-store.js",
     "redis-store.js",
+    "constants.json",
     "README.md"
   ],
   "keywords": [

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .crypto import client_id_for_ip, hmac_sign
 
-_constants = json.loads((Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = json.loads((Path(__file__).resolve().parent / "constants.json").read_text())
 COOKIE_NAME = _constants["COOKIE_NAME"]
 COOKIE_MAX_AGE = _constants["COOKIE_MAX_AGE"]
 

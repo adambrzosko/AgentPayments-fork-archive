@@ -16,7 +16,7 @@ const {
   SOLANA_CHAIN_ID_DEVNET,
   PLATFORM_API_URL,
   HOSTED_KEY_PREFIX,
-} = require('../constants.json');
+} = require('./constants.json');
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const PAYMENT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 const PAYMENT_CACHE_MAX = 1000;

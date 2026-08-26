@@ -41,5 +41,8 @@ Repository    = "https://github.com/agentpayments/agentpayments"
 where   = ["."]
 include = ["agentpayments_python*"]
 
+[tool.setuptools.package-data]
+agentpayments_python = ["constants.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

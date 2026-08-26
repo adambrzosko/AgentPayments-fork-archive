@@ -13,7 +13,7 @@ from .platform_client import HOSTED_KEY_PREFIX, PlatformClient, is_valid_hosted_
 
 import json as _json
 from pathlib import Path as _Path
-_constants = _json.loads((_Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = _json.loads((_Path(__file__).resolve().parent / "constants.json").read_text())
 MAX_NONCE_LENGTH = _constants["MAX_NONCE_LENGTH"]
 MAX_RETURN_TO_LENGTH = _constants["MAX_RETURN_TO_LENGTH"]
 MAX_FP_LENGTH = _constants["MAX_FP_LENGTH"]

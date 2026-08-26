@@ -24,7 +24,7 @@ import urllib.error
 
 from pathlib import Path as _Path
 
-_constants = json.loads((_Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = json.loads((_Path(__file__).resolve().parent / "constants.json").read_text())
 PLATFORM_API_URL: str = _constants["PLATFORM_API_URL"]
 HOSTED_KEY_PREFIX: str = _constants["HOSTED_KEY_PREFIX"]
 

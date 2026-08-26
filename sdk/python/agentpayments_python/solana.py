@@ -47,7 +47,7 @@ _payment_cache = _PaymentCache()
 
 BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
-_constants = json.loads((Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = json.loads((Path(__file__).resolve().parent / "constants.json").read_text())
 MIN_PAYMENT_MICRO = round(_constants["MIN_PAYMENT"] * 1_000_000)  # integer micro-USDC threshold
 USDC_MINT_DEVNET = _constants["USDC_MINT_DEVNET"]
 USDC_MINT_MAINNET = _constants["USDC_MINT_MAINNET"]

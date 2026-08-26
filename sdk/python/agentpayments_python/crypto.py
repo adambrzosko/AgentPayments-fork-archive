@@ -4,7 +4,7 @@ import json
 import uuid
 from pathlib import Path
 
-_constants = json.loads((Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = json.loads((Path(__file__).resolve().parent / "constants.json").read_text())
 KEY_PREFIX = _constants["KEY_PREFIX"]
 MAX_KEY_LENGTH = _constants["MAX_KEY_LENGTH"]
 

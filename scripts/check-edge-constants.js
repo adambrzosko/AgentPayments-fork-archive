@@ -2,8 +2,10 @@
 /**
  * check-edge-constants.js
  *
- * Validates that sdk/edge/index.js inlined constants match sdk/constants.json.
- * Run this in CI or before publishing to catch drift between the two files.
+ * Validates that sdk/edge/index.js inlined constants, and the constants.json
+ * copies bundled inside the Node and Python packages, all match the
+ * canonical sdk/constants.json. Run this in CI or before publishing to catch
+ * drift between the files.
  *
  * Usage:  node scripts/check-edge-constants.js
  * Exit 0 = all match, exit 1 = mismatch(es) found.
@@ -78,10 +80,33 @@ for (const { key, type } of CHECKS) {
   }
 }
 
+// Bundled copies that must stay byte-for-byte identical to sdk/constants.json
+// (each published package reads its own local copy so it works standalone,
+// outside the monorepo — see sdk/node/index.js and the *_adapter.py files).
+const BUNDLED_COPIES = [
+  'sdk/node/constants.json',
+  'sdk/python/agentpayments_python/constants.json',
+];
+
+const canonRaw = fs.readFileSync(path.join(root, 'sdk/constants.json'), 'utf8');
+for (const rel of BUNDLED_COPIES) {
+  const copyPath = path.join(root, rel);
+  if (!fs.existsSync(copyPath)) {
+    console.error(`MISSING bundled copy: ${rel}`);
+    failures++;
+    continue;
+  }
+  const copyRaw = fs.readFileSync(copyPath, 'utf8');
+  if (copyRaw !== canonRaw) {
+    console.error(`OUT OF SYNC: ${rel} does not match sdk/constants.json (copy it over)`);
+    failures++;
+  }
+}
+
 if (failures === 0) {
-  console.log(`✓ All ${CHECKS.length} edge constants match constants.json`);
+  console.log(`✓ All ${CHECKS.length} edge constants and ${BUNDLED_COPIES.length} bundled copies match constants.json`);
   process.exit(0);
 } else {
-  console.error(`\n${failures} mismatch(es) found. Update sdk/edge/index.js to match sdk/constants.json.`);
+  console.error(`\n${failures} mismatch(es) found.`);
   process.exit(1);
 }

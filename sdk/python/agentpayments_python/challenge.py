@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .crypto import client_id_for_ip, hmac_sign, sha256_hex
 
-_constants = json.loads((Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = json.loads((Path(__file__).resolve().parent / "constants.json").read_text())
 POW_DIFFICULTY = _constants["POW_DIFFICULTY"]
 MAX_POW_LENGTH = _constants["MAX_POW_LENGTH"]
 NONCE_TTL_MS = _constants["NONCE_TTL_MS"]

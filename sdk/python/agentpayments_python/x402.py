@@ -12,7 +12,7 @@ import json as _json
 import math
 from pathlib import Path as _Path
 
-_constants = _json.loads((_Path(__file__).resolve().parent.parent.parent / "constants.json").read_text())
+_constants = _json.loads((_Path(__file__).resolve().parent / "constants.json").read_text())
 
 USDC_DECIMALS: int = _constants["USDC_DECIMALS"]
 X402_VERSION: int = _constants["X402_VERSION"]

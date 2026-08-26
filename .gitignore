@@ -22,3 +22,8 @@ llm_wallet_hub/data/db.json
 
 # Python packaging artifacts
 *.egg-info/
+sdk/python/dist/
+sdk/python/build/
+
+# npm packaging artifacts
+*.tgz
