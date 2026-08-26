@@ -65,6 +65,8 @@ class PlatformClient:
         self.api_key = api_key
         self.platform_url = platform_url.rstrip("/")
         self._verification_secret: str | None = None
+        self._platform_fee_info: dict | None = None
+        self._account_fetched = False
         self._lock = threading.Lock()
 
     def _auth_headers(self) -> dict:
@@ -98,18 +100,37 @@ class PlatformClient:
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"Platform API {path} returned {exc.code}") from exc
 
+    def _ensure_account_fetched(self) -> None:
+        """Fetch + cache the /v1/account response once (thread-safe, double-checked)."""
+        if self._account_fetched:
+            return
+        with self._lock:
+            if self._account_fetched:
+                return
+            data = self._get("/v1/account")
+            self._verification_secret = data["verificationSecret"]
+            fee_wallet = data.get("platformFeeWallet")
+            self._platform_fee_info = (
+                {"wallet": fee_wallet, "rate_pct": data.get("platformFeeRatePct")}
+                if fee_wallet
+                else None
+            )
+            self._account_fetched = True
+
     @property
     def verification_secret(self) -> str:
         """Fetch + cache verificationSecret from /v1/account (thread-safe)."""
-        if self._verification_secret:
-            return self._verification_secret
-        with self._lock:
-            # Double-checked locking
-            if self._verification_secret:
-                return self._verification_secret
-            data = self._get("/v1/account")
-            self._verification_secret = data["verificationSecret"]
+        self._ensure_account_fetched()
         return self._verification_secret
+
+    def get_platform_fee_info(self) -> dict | None:
+        """
+        Fetch + cache the on-chain platform fee config from /v1/account (same
+        request as verification_secret — no extra round trip if already fetched).
+        Returns {"wallet": str, "rate_pct": float} or None if no fee is configured.
+        """
+        self._ensure_account_fetched()
+        return self._platform_fee_info
 
     def issue_key(self) -> str:
         """Issue a single platform-signed agent key (agp_...). Metered."""

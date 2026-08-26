@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import re
@@ -96,8 +98,15 @@ def is_valid_solana_address(address: str) -> bool:
     return bool(address and BASE58_RE.match(address))
 
 
-def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url, usdc_mint: str) -> bool:
-    """Verify payment on-chain. rpc_url may be a string or list of strings (fallback URLs)."""
+def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url, usdc_mint: str, fee_info: dict | None = None) -> bool:
+    """
+    Verify payment on-chain. rpc_url may be a string or list of strings (fallback URLs).
+
+    fee_info, when set (hosted-platform mode with an on-chain fee configured), is
+    {"wallet": str, "rate_pct": float}. When set, the SAME transaction that carries
+    the vendor payment must also carry a USDC transfer to fee_info["wallet"] of at
+    least MIN_PAYMENT * rate_pct / 100, or the payment is treated as unverified.
+    """
     # Normalise to list so _rpc_call_with_fallback always gets a list.
     rpc_urls: list[str] = rpc_url if isinstance(rpc_url, list) else [rpc_url]
 
@@ -120,6 +129,15 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url, usdc_m
         vendor_usdc_accounts = set(token_accounts)
         if not vendor_usdc_accounts:
             return False  # vendor has no USDC account yet — no payment possible
+
+        fee_usdc_accounts = None
+        fee_amount_micro = 0
+        if fee_info:
+            fee_ata_data = _rpc_call_with_fallback(rpc_urls, "getTokenAccountsByOwner", [fee_info["wallet"], {"mint": usdc_mint}, {"encoding": "jsonParsed", "commitment": "finalized"}])
+            fee_usdc_accounts = {a["pubkey"] for a in fee_ata_data.get("result", {}).get("value", [])}
+            fee_amount_micro = round(MIN_PAYMENT_MICRO * fee_info["rate_pct"] / 100)
+            if not fee_usdc_accounts:
+                return False  # fee wallet has no USDC account — fee can never be satisfied
 
         addresses_to_scan = [wallet_address] + token_accounts
         seen = set()
@@ -154,6 +172,7 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url, usdc_m
 
             has_memo = False
             has_payment = False
+            has_fee_payment = fee_info is None  # vacuously satisfied when no fee is required
 
             for ix in all_ix:
                 program = ix.get("program", "")
@@ -169,8 +188,12 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url, usdc_m
                     tx_type = parsed.get("type", "")
                     if tx_type in ("transfer", "transferChecked"):
                         info = parsed.get("info", {})
-                        # Payment must be delivered to one of the vendor's USDC token accounts.
-                        if info.get("destination") not in vendor_usdc_accounts:
+                        destination = info.get("destination")
+                        # Payment must be delivered to one of the vendor's or fee
+                        # wallet's USDC token accounts — anything else is irrelevant.
+                        is_vendor_dest = destination in vendor_usdc_accounts
+                        is_fee_dest = fee_usdc_accounts is not None and destination in fee_usdc_accounts
+                        if not is_vendor_dest and not is_fee_dest:
                             continue
                         if tx_type == "transferChecked" and info.get("mint") != usdc_mint:
                             continue
@@ -183,10 +206,12 @@ def verify_payment_on_chain(agent_key: str, wallet_address: str, rpc_url, usdc_m
                             amount_micro = int(amount_str)
                         except (ValueError, TypeError):
                             amount_micro = 0
-                        if amount_micro >= MIN_PAYMENT_MICRO:
+                        if is_vendor_dest and amount_micro >= MIN_PAYMENT_MICRO:
                             has_payment = True
+                        elif is_fee_dest and amount_micro >= fee_amount_micro:
+                            has_fee_payment = True
 
-            if has_memo and has_payment:
+            if has_memo and has_payment and has_fee_payment:
                 _payment_cache.set(agent_key, True, PAYMENT_CACHE_TTL)
                 return True
     except Exception:

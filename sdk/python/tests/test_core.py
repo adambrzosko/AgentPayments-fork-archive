@@ -587,8 +587,47 @@ def _rpc_response(result):
     )
 
 
-def _build_tx(memo: str, amount: float, mint: str, destination_owner: str, ok=True):
-    """Build a minimal mock RPC getTransaction response for a transferChecked."""
+def _build_tx(memo: str, amount: float, mint: str, destination_owner: str, ok=True, fee_amount: float = None):
+    """Build a minimal mock RPC getTransaction response for a transferChecked.
+
+    fee_amount, if given, adds a second transferChecked instruction (in the SAME
+    transaction) to a distinct "fee_ata_address" destination — simulating the
+    on-chain platform fee leg.
+    """
+    instructions = [
+        {
+            "program": "spl-token",
+            "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "parsed": {
+                "type": "transferChecked",
+                "info": {
+                    "mint": mint,
+                    "tokenAmount": {"uiAmount": amount, "amount": str(round(amount * 1_000_000)), "decimals": 6},
+                    "destination": "dest_ata_address",
+                    "authority": "payer_address",
+                },
+            },
+        },
+    ]
+    if fee_amount is not None:
+        instructions.append({
+            "program": "spl-token",
+            "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "parsed": {
+                "type": "transferChecked",
+                "info": {
+                    "mint": mint,
+                    "tokenAmount": {"uiAmount": fee_amount, "amount": str(round(fee_amount * 1_000_000)), "decimals": 6},
+                    "destination": "fee_ata_address",
+                    "authority": "payer_address",
+                },
+            },
+        })
+    instructions.append({
+        "program": "spl-memo",
+        "programId": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+        "parsed": memo,
+    })
     return {
         "meta": {
             "err": None if ok else {"InstructionError": [0, "Custom"]},
@@ -597,26 +636,7 @@ def _build_tx(memo: str, amount: float, mint: str, destination_owner: str, ok=Tr
         },
         "transaction": {
             "message": {
-                "instructions": [
-                    {
-                        "program": "spl-token",
-                        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                        "parsed": {
-                            "type": "transferChecked",
-                            "info": {
-                                "mint": mint,
-                                "tokenAmount": {"uiAmount": amount, "amount": str(round(amount * 1_000_000)), "decimals": 6},
-                                "destination": "dest_ata_address",
-                                "authority": "payer_address",
-                            },
-                        },
-                    },
-                    {
-                        "program": "spl-memo",
-                        "programId": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
-                        "parsed": memo,
-                    },
-                ],
+                "instructions": instructions,
                 "accountKeys": [],
             }
         },
@@ -625,21 +645,28 @@ def _build_tx(memo: str, amount: float, mint: str, destination_owner: str, ok=Tr
 
 class TestVerifyPaymentOnChain:
     WALLET = "5rXZeAEbg13DQnSFijEno2hKEJLK2p14fAo3AmPtfBft"
+    FEE_WALLET = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
     MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"  # devnet USDC
     RPC = "https://api.devnet.solana.com"
 
     def _fresh_key(self):
         return generate_agent_key(SECRET)
 
-    def _patch_rpc(self, sigs_result, ata_result, tx_result):
-        """Return a context manager that patches requests.post with ordered responses."""
-        from unittest.mock import call
+    def _patch_rpc(self, sigs_result, ata_result, tx_result, fee_ata_result=None):
+        """Return a context manager that patches requests.post with ordered responses.
 
-        responses = []
+        When fee_ata_result is given, getTokenAccountsByOwner is dispatched by the
+        queried owner (params[0]): self.WALLET -> ata_result, self.FEE_WALLET ->
+        fee_ata_result — mirrors the two separate ATA lookups verify_payment_on_chain
+        makes when fee_info is set.
+        """
 
         def side_effect(url, json=None, timeout=None):
             method = json.get("method", "")
             if method == "getTokenAccountsByOwner":
+                owner = (json.get("params") or [None])[0]
+                if fee_ata_result is not None and owner == self.FEE_WALLET:
+                    return _rpc_response(fee_ata_result)
                 return _rpc_response(ata_result)
             if method == "getSignaturesForAddress":
                 return _rpc_response(sigs_result)
@@ -765,3 +792,107 @@ class TestVerifyPaymentOnChain:
         with patch("requests.post", side_effect=Exception("should not be called")):
             result = verify_payment_on_chain(key, self.WALLET, self.RPC, self.MINT)
         assert result is False
+
+
+class TestVerifyPaymentOnChainFee:
+    """On-chain platform fee leg — hosted-mode vendors only (fee_info set)."""
+
+    WALLET = TestVerifyPaymentOnChain.WALLET
+    FEE_WALLET = TestVerifyPaymentOnChain.FEE_WALLET
+    MINT = TestVerifyPaymentOnChain.MINT
+    RPC = TestVerifyPaymentOnChain.RPC
+    FEE_INFO = {"wallet": FEE_WALLET, "rate_pct": 2}
+    FEE_AMOUNT = 0.01 * 0.02  # 2% of MIN_PAYMENT (0.01)
+
+    def _fresh_key(self):
+        return generate_agent_key(SECRET)
+
+    def _ata(self, pubkey, owner):
+        return {"value": [{"pubkey": pubkey, "account": {"data": {"parsed": {"info": {"mint": self.MINT, "owner": owner}}}}}]}
+
+    def _patch_rpc(self, sigs_result, ata_result, tx_result, fee_ata_result):
+        """getTokenAccountsByOwner is dispatched by the queried owner (params[0])."""
+
+        def side_effect(url, json=None, timeout=None):
+            method = json.get("method", "")
+            if method == "getTokenAccountsByOwner":
+                owner = (json.get("params") or [None])[0]
+                return _rpc_response(fee_ata_result if owner == self.FEE_WALLET else ata_result)
+            if method == "getSignaturesForAddress":
+                return _rpc_response(sigs_result)
+            if method == "getTransaction":
+                return _rpc_response(tx_result)
+            return _rpc_response(None)
+
+        return patch("requests.post", side_effect=side_effect)
+
+    def test_fee_leg_missing_denies_access(self):
+        from agentpayments_python.solana import verify_payment_on_chain
+        key = self._fresh_key()
+        tx = _build_tx(key, 0.01, self.MINT, self.WALLET)  # vendor leg only, no fee leg
+        ata = self._ata("dest_ata_address", self.WALLET)
+        fee_ata = self._ata("fee_ata_address", self.FEE_WALLET)
+        sigs = [{"signature": "fee_sig_missing", "err": None}]
+        with self._patch_rpc(sigs, ata, tx, fee_ata):
+            result = verify_payment_on_chain(key, self.WALLET, self.RPC, self.MINT, fee_info=self.FEE_INFO)
+        assert result is False
+
+    def test_fee_leg_present_grants_access(self):
+        from agentpayments_python.solana import verify_payment_on_chain
+        key = self._fresh_key()
+        tx = _build_tx(key, 0.01, self.MINT, self.WALLET, fee_amount=self.FEE_AMOUNT)
+        ata = self._ata("dest_ata_address", self.WALLET)
+        fee_ata = self._ata("fee_ata_address", self.FEE_WALLET)
+        sigs = [{"signature": "fee_sig_ok", "err": None}]
+        with self._patch_rpc(sigs, ata, tx, fee_ata):
+            result = verify_payment_on_chain(key, self.WALLET, self.RPC, self.MINT, fee_info=self.FEE_INFO)
+        assert result is True
+
+    def test_fee_leg_underpaid_denies_access(self):
+        from agentpayments_python.solana import verify_payment_on_chain
+        key = self._fresh_key()
+        tx = _build_tx(key, 0.01, self.MINT, self.WALLET, fee_amount=self.FEE_AMOUNT / 2)
+        ata = self._ata("dest_ata_address", self.WALLET)
+        fee_ata = self._ata("fee_ata_address", self.FEE_WALLET)
+        sigs = [{"signature": "fee_sig_underpaid", "err": None}]
+        with self._patch_rpc(sigs, ata, tx, fee_ata):
+            result = verify_payment_on_chain(key, self.WALLET, self.RPC, self.MINT, fee_info=self.FEE_INFO)
+        assert result is False
+
+    def test_fee_wallet_with_no_usdc_account_denies_access(self):
+        from agentpayments_python.solana import verify_payment_on_chain
+        key = self._fresh_key()
+        tx = _build_tx(key, 0.01, self.MINT, self.WALLET, fee_amount=self.FEE_AMOUNT)
+        ata = self._ata("dest_ata_address", self.WALLET)
+        fee_ata = {"value": []}  # fee wallet has no USDC ATA yet
+        sigs = [{"signature": "fee_sig_no_ata", "err": None}]
+        with self._patch_rpc(sigs, ata, tx, fee_ata):
+            result = verify_payment_on_chain(key, self.WALLET, self.RPC, self.MINT, fee_info=self.FEE_INFO)
+        assert result is False
+
+    def test_no_fee_info_skips_fee_check_entirely(self):
+        """fee_info=None (self-hosted / no platform fee configured) behaves exactly
+        like today: only one getTokenAccountsByOwner call, vendor leg alone suffices."""
+        from agentpayments_python.solana import verify_payment_on_chain
+        key = self._fresh_key()
+        tx = _build_tx(key, 0.01, self.MINT, self.WALLET)  # vendor leg only
+        ata = self._ata("dest_ata_address", self.WALLET)
+        sigs = [{"signature": "fee_sig_none", "err": None}]
+
+        ata_calls = {"n": 0}
+
+        def side_effect(url, json=None, timeout=None):
+            method = json.get("method", "")
+            if method == "getTokenAccountsByOwner":
+                ata_calls["n"] += 1
+                return _rpc_response(ata)
+            if method == "getSignaturesForAddress":
+                return _rpc_response(sigs)
+            if method == "getTransaction":
+                return _rpc_response(tx)
+            return _rpc_response(None)
+
+        with patch("requests.post", side_effect=side_effect):
+            result = verify_payment_on_chain(key, self.WALLET, self.RPC, self.MINT, fee_info=None)
+        assert result is True
+        assert ata_calls["n"] == 1
