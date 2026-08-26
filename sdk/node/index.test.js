@@ -3,7 +3,7 @@
  * Node SDK unit tests — node:test
  * Run: node --test sdk/node/index.test.js
  */
-const { test, describe, before } = require('node:test');
+const { test, describe, before, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 
@@ -12,7 +12,7 @@ const crypto = require('node:crypto');
 // the middleware with crafted req/res objects, or by reading exported symbols
 // added under __test__ in the source. Rather than patching the source we keep
 // all internal helpers testable through the public surface and a minimal shim.
-const { agentPaymentsGate } = require('./index.js');
+const { agentPaymentsGate, verifyPaymentOnChain } = require('./index.js');
 const { MemoryGrantStore, FileGrantStore } = require('./grant-store.js');
 const os = require('node:os');
 const path = require('node:path');
@@ -469,5 +469,109 @@ describe('Rate limiter (via challenge verify path)', () => {
       if (r._status === 429) { last429 = true; break; }
     }
     assert.ok(last429, 'rate limiter should kick in after 10 agent-key requests/min');
+  });
+});
+
+// ─── verifyPaymentOnChain: RPC mocking via global.fetch ────────────────────
+describe('verifyPaymentOnChain', () => {
+  const WALLET = '5rXZeAEbg13DQnSFijEno2hKEJLK2p14fAo3AmPtfBft';
+  const FEE_WALLET = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
+  const MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'; // devnet USDC
+  const RPC = 'https://api.devnet.solana.com';
+  const MIN_PAYMENT = 0.01;
+  const FEE_INFO = { wallet: FEE_WALLET, ratePct: 2 };
+  const FEE_AMOUNT = MIN_PAYMENT * 0.02;
+
+  const realFetch = global.fetch;
+  afterEach(() => { global.fetch = realFetch; });
+
+  function ata(pubkey) {
+    return { value: [{ pubkey, account: { data: { parsed: { info: { mint: MINT } } } } }] };
+  }
+
+  function buildTx(memo, amount, { feeAmount } = {}) {
+    const instructions = [{
+      program: 'spl-token',
+      programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+      parsed: { type: 'transferChecked', info: { mint: MINT, tokenAmount: { amount: String(Math.round(amount * 1e6)) }, destination: 'dest_ata_address' } },
+    }];
+    if (feeAmount !== undefined) {
+      instructions.push({
+        program: 'spl-token',
+        programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        parsed: { type: 'transferChecked', info: { mint: MINT, tokenAmount: { amount: String(Math.round(feeAmount * 1e6)) }, destination: 'fee_ata_address' } },
+      });
+    }
+    instructions.push({ program: 'spl-memo', programId: 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr', parsed: memo });
+    return { meta: { err: null, innerInstructions: [] }, transaction: { message: { instructions } } };
+  }
+
+  // Dispatches RPC calls by method (and, for getTokenAccountsByOwner, by which
+  // owner address is being queried — vendor wallet vs fee wallet get different
+  // ATA sets when both are queried in one verify call).
+  function mockRpc({ sigs, ata: vendorAta, feeAta, tx }) {
+    global.fetch = async (url, opts) => {
+      const body = JSON.parse(opts.body);
+      let result = null;
+      if (body.method === 'getTokenAccountsByOwner') {
+        const owner = body.params[0];
+        result = (feeAta !== undefined && owner === FEE_WALLET) ? feeAta : vendorAta;
+      } else if (body.method === 'getSignaturesForAddress') {
+        result = sigs;
+      } else if (body.method === 'getTransaction') {
+        result = tx;
+      }
+      return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: 1, result }) };
+    };
+  }
+
+  test('vendor leg alone passes when no fee is required', async () => {
+    const key = 'agp_test_key';
+    mockRpc({ sigs: [{ signature: 'sig1', err: null }], ata: ata('dest_ata_address'), tx: buildTx(key, MIN_PAYMENT) });
+    const result = await verifyPaymentOnChain(key, WALLET, [RPC], MINT, MIN_PAYMENT, null);
+    assert.equal(result, true);
+  });
+
+  test('fee leg missing denies access when fee is required', async () => {
+    const key = 'agp_test_key_2';
+    mockRpc({ sigs: [{ signature: 'sig2', err: null }], ata: ata('dest_ata_address'), feeAta: ata('fee_ata_address'), tx: buildTx(key, MIN_PAYMENT) });
+    const result = await verifyPaymentOnChain(key, WALLET, [RPC], MINT, MIN_PAYMENT, FEE_INFO);
+    assert.equal(result, false);
+  });
+
+  test('both legs in the same transaction grants access', async () => {
+    const key = 'agp_test_key_3';
+    mockRpc({
+      sigs: [{ signature: 'sig3', err: null }],
+      ata: ata('dest_ata_address'),
+      feeAta: ata('fee_ata_address'),
+      tx: buildTx(key, MIN_PAYMENT, { feeAmount: FEE_AMOUNT }),
+    });
+    const result = await verifyPaymentOnChain(key, WALLET, [RPC], MINT, MIN_PAYMENT, FEE_INFO);
+    assert.equal(result, true);
+  });
+
+  test('underpaid fee leg denies access', async () => {
+    const key = 'agp_test_key_4';
+    mockRpc({
+      sigs: [{ signature: 'sig4', err: null }],
+      ata: ata('dest_ata_address'),
+      feeAta: ata('fee_ata_address'),
+      tx: buildTx(key, MIN_PAYMENT, { feeAmount: FEE_AMOUNT / 2 }),
+    });
+    const result = await verifyPaymentOnChain(key, WALLET, [RPC], MINT, MIN_PAYMENT, FEE_INFO);
+    assert.equal(result, false);
+  });
+
+  test('fee wallet with no USDC account denies access', async () => {
+    const key = 'agp_test_key_5';
+    mockRpc({
+      sigs: [{ signature: 'sig5', err: null }],
+      ata: ata('dest_ata_address'),
+      feeAta: { value: [] },
+      tx: buildTx(key, MIN_PAYMENT, { feeAmount: FEE_AMOUNT }),
+    });
+    const result = await verifyPaymentOnChain(key, WALLET, [RPC], MINT, MIN_PAYMENT, FEE_INFO);
+    assert.equal(result, false);
   });
 });

@@ -230,31 +230,52 @@ class PlatformClient {
     this.apiKey = apiKey;
     this.platformUrl = platformUrl.replace(/\/$/, '');
     this._verificationSecret = null;
-    this._secretFetch = null;
+    this._platformFeeInfo = undefined; // undefined = not fetched yet; null = fetched, no fee configured
+    this._accountFetch = null;
   }
 
   _authHeaders() {
     return { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' };
   }
 
-  /** Lazily fetch + cache the verificationSecret from the platform. */
-  async getVerificationSecret() {
-    if (this._verificationSecret) return this._verificationSecret;
-    if (this._secretFetch) return this._secretFetch;
-    this._secretFetch = fetch(`${this.platformUrl}/v1/account`, { headers: this._authHeaders() })
+  /** Lazily fetch + cache the /v1/account response (verificationSecret + fee info). */
+  _fetchAccount() {
+    if (this._accountFetch) return this._accountFetch;
+    this._accountFetch = fetch(`${this.platformUrl}/v1/account`, { headers: this._authHeaders() })
       .then((r) => {
         if (!r.ok) throw new Error(`Platform /v1/account returned ${r.status}`);
         return r.json();
       })
       .then((data) => {
         this._verificationSecret = data.verificationSecret;
-        return data.verificationSecret;
+        this._platformFeeInfo = data.platformFeeWallet
+          ? { wallet: data.platformFeeWallet, ratePct: data.platformFeeRatePct }
+          : null;
+        return data;
       })
       .catch((err) => {
-        this._secretFetch = null; // allow retry on next call
+        this._accountFetch = null; // allow retry on next call
         throw err;
       });
-    return this._secretFetch;
+    return this._accountFetch;
+  }
+
+  /** Lazily fetch + cache the verificationSecret from the platform. */
+  async getVerificationSecret() {
+    if (this._verificationSecret) return this._verificationSecret;
+    await this._fetchAccount();
+    return this._verificationSecret;
+  }
+
+  /**
+   * Lazily fetch + cache the on-chain platform fee config (same request as
+   * getVerificationSecret — no extra round trip if already fetched).
+   * Returns { wallet, ratePct } or null if no fee is configured.
+   */
+  async getPlatformFeeInfo() {
+    if (this._platformFeeInfo !== undefined) return this._platformFeeInfo;
+    await this._fetchAccount();
+    return this._platformFeeInfo;
   }
 
   /** Issue a single platform-signed agent key (agp_...). Metered server-side. */
@@ -307,7 +328,15 @@ async function rpcCallWithFallback(rpcUrls, method, params, opts) {
   throw lastError;
 }
 
-async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, minPayment = MIN_PAYMENT) {
+/**
+ * Verify payment on-chain.
+ *
+ * feeInfo, when set (hosted-platform mode with an on-chain fee configured), is
+ * { wallet, ratePct }. When set, the SAME transaction that carries the vendor
+ * payment must also carry a USDC transfer to feeInfo.wallet of at least
+ * minPayment * ratePct / 100, or the payment is treated as unverified.
+ */
+async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, minPayment = MIN_PAYMENT, feeInfo = null) {
   try {
     // commitment: 'finalized' — confirmed blocks can be rolled back (rare but possible).
     // Finalized adds ~10-20s latency vs confirmed but guarantees irreversibility.
@@ -323,6 +352,19 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, 
     // token is USDC for plain `transfer` instructions (which carry no mint field).
     const vendorUsdcAccounts = new Set(tokenAccounts);
     if (vendorUsdcAccounts.size === 0) return false; // vendor has no USDC account yet — no payment possible
+
+    let feeUsdcAccounts = null;
+    let feeAmountMicro = 0;
+    if (feeInfo) {
+      const feeAtaData = await rpcCallWithFallback(rpcUrls, 'getTokenAccountsByOwner', [
+        feeInfo.wallet,
+        { mint: usdcMint },
+        { encoding: 'jsonParsed', commitment: 'finalized' },
+      ]);
+      feeUsdcAccounts = new Set((feeAtaData.result?.value || []).map((a) => a.pubkey));
+      feeAmountMicro = Math.round(Math.round(minPayment * 1e6) * feeInfo.ratePct / 100);
+      if (feeUsdcAccounts.size === 0) return false; // fee wallet has no USDC account — fee can never be satisfied
+    }
 
     const addressesToScan = [walletAddress, ...tokenAccounts];
     const seen = new Set();
@@ -360,6 +402,7 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, 
 
       let hasMemo = false;
       let hasPayment = false;
+      let hasFeePayment = !feeInfo; // vacuously satisfied when no fee is required
 
       for (const ix of allInstructions) {
         if (ix.program === 'spl-memo' || ix.programId === MEMO_PROGRAM) {
@@ -371,21 +414,26 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, 
           const parsed = ix.parsed || {};
           if (parsed.type === 'transfer' || parsed.type === 'transferChecked') {
             const info = parsed.info || {};
-            // Payment must be delivered to one of the vendor's USDC token accounts.
-            if (!vendorUsdcAccounts.has(info.destination)) continue;
+            // Payment must be delivered to one of the vendor's or fee wallet's USDC
+            // token accounts — anything else is irrelevant.
+            const isVendorDest = vendorUsdcAccounts.has(info.destination);
+            const isFeeDest = feeUsdcAccounts !== null && feeUsdcAccounts.has(info.destination);
+            if (!isVendorDest && !isFeeDest) continue;
             if (parsed.type === 'transferChecked' && info.mint !== usdcMint) continue;
             // Use integer base-unit comparison to avoid float precision issues at
             // the payment threshold. tokenAmount.amount (transferChecked) and
             // amount (transfer) are both integer strings in micro-USDC.
             const amountStr = info.tokenAmount?.amount ?? info.amount ?? '0';
             const amountMicro = parseInt(amountStr, 10);
+            if (Number.isNaN(amountMicro)) continue;
             const minPaymentMicro = Math.round(minPayment * 1e6);
-            if (!Number.isNaN(amountMicro) && amountMicro >= minPaymentMicro) hasPayment = true;
+            if (isVendorDest && amountMicro >= minPaymentMicro) hasPayment = true;
+            else if (isFeeDest && amountMicro >= feeAmountMicro) hasFeePayment = true;
           }
         }
       }
 
-      if (hasMemo && hasPayment) return true;
+      if (hasMemo && hasPayment && hasFeePayment) return true;
     }
   } catch (error) {
     gateLog('error', 'Solana RPC error', { error: error.message });
@@ -530,6 +578,30 @@ function buildX402PaymentRequirements({ walletAddress, mint, minPayment, debug, 
   };
   if (resource) req.resource = resource;
   return req;
+}
+
+/**
+ * Builds the custom `payment` object (NOT part of the x402 spec — that's
+ * buildX402PaymentRequirements above, which stays vendor-leg-only). When feeInfo
+ * is set (hosted-platform mode with an on-chain fee configured), adds a
+ * platform_fee field describing the second required transfer. Deliberately not
+ * added as a second x402 accepts[] entry — that would read to a spec-compliant
+ * client as an alternative payment method, not an additional requirement.
+ */
+function buildPaymentField({ network, minPayment, walletAddress, memo, feeInfo, instructions }) {
+  const payment = { chain: 'solana', network, token: 'USDC', amount: String(minPayment), wallet_address: walletAddress, memo };
+  if (feeInfo) {
+    const feeAmountMicro = Math.round(Math.round(minPayment * 1e6) * feeInfo.ratePct / 100);
+    payment.platform_fee = {
+      wallet_address: feeInfo.wallet,
+      amount: String(feeAmountMicro / 1e6),
+      token: 'USDC',
+      rate_pct: feeInfo.ratePct,
+      note: 'Must be a second USDC transfer inside the SAME Solana transaction as the payment above, or access will be denied.',
+    };
+  }
+  if (instructions) payment.instructions = instructions;
+  return payment;
 }
 
 /**
@@ -707,6 +779,17 @@ function agentPaymentsGate(config = {}) {
     if (!isBrowser(req)) {
       const agentKey = req.get('X-Agent-Key');
 
+      // Resolve the on-chain platform fee requirement once (hosted-platform mode
+      // only — always null for self-hosted vendors with no platformClient).
+      let feeInfo = null;
+      if (platformClient) {
+        try {
+          feeInfo = await platformClient.getPlatformFeeInfo();
+        } catch (err) {
+          gateLog('warn', 'Failed to fetch platform fee info, proceeding without fee enforcement', { error: err.message });
+        }
+      }
+
       if (!agentKey) {
         // Hosted mode: issue a metered platform key (agp_...).
         // Local mode: generate a self-signed key (ag_...).
@@ -722,19 +805,14 @@ function agentPaymentsGate(config = {}) {
         } else {
           newKey = generateAgentKey(secret);
         }
+        const noKeyInstructions = feeInfo
+          ? `Send ${minPayment} USDC on Solana ${debug ? 'devnet' : 'mainnet'} to ${walletAddress} with memo "${newKey}", AND in the SAME transaction send the platform fee (see platform_fee below) to ${feeInfo.wallet}. Then include the header X-Agent-Key: ${newKey} on all subsequent requests.`
+          : `Send ${minPayment} USDC on Solana ${debug ? 'devnet' : 'mainnet'} to ${walletAddress} with memo "${newKey}". Then include the header X-Agent-Key: ${newKey} on all subsequent requests.`;
         return paymentRequiredJson(res, {
           error: 'payment_required',
           message: 'Access requires a paid API key. A key has been generated for you below. Send a USDC payment on Solana with this key as the memo to activate it, then retry your request with the X-Agent-Key header.',
           your_key: newKey,
-          payment: {
-            chain: 'solana',
-            network,
-            token: 'USDC',
-            amount: String(minPayment),
-            wallet_address: walletAddress,
-            memo: newKey,
-            instructions: `Send ${minPayment} USDC on Solana ${debug ? 'devnet' : 'mainnet'} to ${walletAddress} with memo "${newKey}". Then include the header X-Agent-Key: ${newKey} on all subsequent requests.`,
-          },
+          payment: buildPaymentField({ network, minPayment, walletAddress, memo: newKey, feeInfo, instructions: noKeyInstructions }),
         }, { walletAddress, mint, minPayment, debug, agentKey: newKey, resource: req.originalUrl || req.path });
       }
 
@@ -786,10 +864,10 @@ function agentPaymentsGate(config = {}) {
           error: 'payment_required',
           message: 'Key is valid but payment has not been verified on-chain yet. Please send the USDC payment and allow a few moments for confirmation.',
           your_key: agentKey,
-          payment: { chain: 'solana', network, token: 'USDC', amount: String(minPayment), wallet_address: walletAddress, memo: agentKey },
+          payment: buildPaymentField({ network, minPayment, walletAddress, memo: agentKey, feeInfo }),
         }, { walletAddress, mint, minPayment, debug, agentKey, resource: req.originalUrl || req.path });
       }
-      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, mint, minPayment);
+      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, mint, minPayment, feeInfo);
       paymentCache.set(agentKey, paid, paid ? PAYMENT_CACHE_TTL : NEGATIVE_CACHE_TTL_MS);
       if (paid && grantStore) await grantStore.add(agentKey);
       if (!paid) {
@@ -797,14 +875,7 @@ function agentPaymentsGate(config = {}) {
           error: 'payment_required',
           message: 'Key is valid but payment has not been verified on-chain yet. Please send the USDC payment and allow a few moments for confirmation.',
           your_key: agentKey,
-          payment: {
-            chain: 'solana',
-            network,
-            token: 'USDC',
-            amount: String(minPayment),
-            wallet_address: walletAddress,
-            memo: agentKey,
-          },
+          payment: buildPaymentField({ network, minPayment, walletAddress, memo: agentKey, feeInfo }),
         }, { walletAddress, mint, minPayment, debug, agentKey, resource: req.originalUrl || req.path });
       }
 
@@ -833,4 +904,4 @@ function agentPaymentsGate(config = {}) {
   };
 }
 
-module.exports = { agentPaymentsGate, isValidHostedKey, PlatformClient };
+module.exports = { agentPaymentsGate, isValidHostedKey, PlatformClient, verifyPaymentOnChain };
