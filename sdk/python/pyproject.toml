@@ -32,10 +32,10 @@ flask   = ["flask>=3.0"]
 all     = ["Django>=5.0", "fastapi>=0.110", "starlette>=0.37", "flask>=3.0"]
 
 [project.urls]
-Homepage      = "https://github.com/agentpayments/agentpayments"
-Documentation = "https://github.com/agentpayments/agentpayments/tree/main/sdk/python"
-Repository    = "https://github.com/agentpayments/agentpayments"
-"Bug Tracker" = "https://github.com/agentpayments/agentpayments/issues"
+Homepage      = "https://github.com/adambrzosko/AgentPayments"
+Documentation = "https://github.com/adambrzosko/AgentPayments/tree/main/sdk/python"
+Repository    = "https://github.com/adambrzosko/AgentPayments"
+"Bug Tracker" = "https://github.com/adambrzosko/AgentPayments/issues"
 
 [tool.setuptools.packages.find]
 where   = ["."]
