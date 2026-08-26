@@ -332,7 +332,7 @@ async function rpcCallWithFallback(rpcUrls, method, params, opts) {
   throw lastError;
 }
 
-async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint) {
+export async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, minPayment = MIN_PAYMENT) {
   try {
     // commitment: 'finalized' — confirmed blocks can be rolled back (rare but possible).
     const ataData = await rpcCallWithFallback(rpcUrls, 'getTokenAccountsByOwner', [walletAddress, { mint: usdcMint }, { encoding: 'jsonParsed', commitment: 'finalized' }]);
@@ -393,7 +393,7 @@ async function verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint) 
             // Integer base-unit comparison — avoids float precision issues at threshold.
             const amountStr = info.tokenAmount?.amount ?? info.amount ?? '0';
             const amountMicro = parseInt(amountStr, 10);
-            const minPaymentMicro = Math.round(MIN_PAYMENT * 1e6);
+            const minPaymentMicro = Math.round(minPayment * 1e6);
             if (!Number.isNaN(amountMicro) && amountMicro >= minPaymentMicro) hasPayment = true;
           }
         }
@@ -711,7 +711,7 @@ export function createEdgeGate(options = {}) {
           payment: { chain: 'solana', network: debug ? 'devnet' : 'mainnet-beta', token: 'USDC', amount: String(minPayment), wallet_address: walletAddress, memo: agentKey },
         }, { walletAddress, mint: usdcMint, minPayment, debug, agentKey, resource: url.pathname });
       }
-      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint);
+      const paid = await verifyPaymentOnChain(agentKey, walletAddress, rpcUrls, usdcMint, minPayment);
       await store.setCachedPayment(agentKey, paid, paid ? PAYMENT_CACHE_TTL : NEGATIVE_CACHE_TTL_MS);
       if (!paid) {
         return paymentRequiredResponse({
