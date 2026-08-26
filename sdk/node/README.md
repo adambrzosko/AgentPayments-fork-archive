@@ -37,6 +37,8 @@ app.listen(3000);
 | `solanaRpcUrl` | `string` | Auto (devnet/mainnet) | Custom Solana RPC endpoint. |
 | `usdcMint` | `string` | Auto (devnet/mainnet) | Custom USDC mint address. |
 | `debug` | `boolean` | `process.env.DEBUG !== 'false'` | `true` = devnet + warnings. `false` = mainnet + strict. |
+| `apiKey` | `string` | none | AgentPayments hosted-platform API key (`ap_live_...`). When set, agent keys are issued and metered via the platform instead of self-signed locally. See **Hosted Platform Mode** below. |
+| `platformApiUrl` | `string` | AgentPayments-hosted URL | Override for a self-hosted platform API. |
 
 ## Environment Variables
 
@@ -47,6 +49,27 @@ app.listen(3000);
 | `SOLANA_RPC_URL` | `solanaRpcUrl` |
 | `USDC_MINT` | `usdcMint` |
 | `DEBUG` | `debug` |
+| `AGENTPAYMENTS_API_KEY` | `apiKey` |
+| `AGENTPAYMENTS_PLATFORM_URL` | `platformApiUrl` |
+
+## Hosted Platform Mode
+
+Setting `apiKey` switches agent-key issuance from local (`ag_...`) to platform-issued (`agp_...`), and — when the platform account has an on-chain fee configured — every 402 response's `payment` object gains a `platform_fee` field:
+
+```json
+"payment": {
+  "chain": "solana", "network": "devnet", "token": "USDC",
+  "amount": "0.01", "wallet_address": "<vendor wallet>", "memo": "agp_...",
+  "platform_fee": {
+    "wallet_address": "<platform fee wallet>",
+    "amount": "0.0002",
+    "rate_pct": 2,
+    "note": "Must be a second USDC transfer inside the SAME Solana transaction as the payment above, or access will be denied."
+  }
+}
+```
+
+The agent must send **both transfers in one Solana transaction** — the vendor payment and the platform fee — or the gate denies access exactly as it would for an unpaid key. This field is only ever present in hosted-platform mode with a fee configured; it's absent for self-hosted deployments (no `apiKey`), which are completely unaffected. It's deliberately not part of the standards-compliant `accepts[]`/`X-PAYMENT-REQUIRED` x402 fields — those still describe only the vendor leg, so generic x402 clients aren't misled into thinking they can pay either destination.
 
 ## Security Features
 

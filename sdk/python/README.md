@@ -80,8 +80,14 @@ register_agentpayments(
 | `solana_rpc_url` | No | Auto (devnet/mainnet) | Custom Solana RPC endpoint. |
 | `usdc_mint` | No | Auto (devnet/mainnet) | Custom USDC mint address. |
 | `debug` | No | `True` | `True` = devnet. `False` = mainnet + strict mode. |
+| `api_key` | No | `None` | AgentPayments hosted-platform API key (`ap_live_...`). When set, agent keys are issued and metered via the platform instead of self-signed locally. See **Hosted Platform Mode** below. |
+| `platform_url` | No | AgentPayments-hosted URL | Override for a self-hosted platform API. |
 
-Django reads these from `settings.*` (e.g., `settings.CHALLENGE_SECRET`). FastAPI and Flask accept them as constructor arguments.
+Django reads these from `settings.*` (e.g., `settings.CHALLENGE_SECRET`, `settings.AGENTPAYMENTS_API_KEY`). FastAPI and Flask accept them as constructor arguments.
+
+## Hosted Platform Mode
+
+Setting `api_key` switches agent-key issuance from local (`ag_...`) to platform-issued (`agp_...`), and — when the platform account has an on-chain fee configured — every 402 response's `payment` dict gains a `platform_fee` field describing a second required USDC transfer, to be sent in the **same Solana transaction** as the vendor payment. Missing that second transfer is treated as an unpaid request, same as any other invalid payment. This is opt-in per vendor account and has no effect on self-hosted deployments (no `api_key`). The standards-compliant `accepts[]`/`X-PAYMENT-REQUIRED` x402 fields are untouched — they still describe only the vendor leg.
 
 ## Security Features
 

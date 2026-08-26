@@ -107,6 +107,30 @@ X-Agent-Key: ag_abc123def456_9f8e7d6c5b4a3210
 
 **Response:** The upstream resource is served normally. Subsequent requests with the same key are served from cache (10-min TTL) without additional RPC calls.
 
+## Hosted Platform Mode & On-Chain Fee
+
+When the gate is configured with a hosted-platform API key (`apiKey` / `AGENTPAYMENTS_API_KEY` / `api_key`), agent keys are issued and metered via the AgentPayments platform (`agp_...` prefix) instead of self-signed locally (`ag_...`). This has no effect on self-hosted deployments — it's opt-in per vendor account.
+
+When the platform account also has an on-chain fee configured, every `payment` object in a 402 response (Steps 1 and 3 above) gains a `platform_fee` field:
+
+```json
+"payment": {
+  "chain": "solana", "network": "devnet", "token": "USDC",
+  "amount": "0.01", "wallet_address": "<vendor wallet>", "memo": "agp_...",
+  "platform_fee": {
+    "wallet_address": "<platform fee wallet>",
+    "amount": "0.0002",
+    "token": "USDC",
+    "rate_pct": 2,
+    "note": "Must be a second USDC transfer inside the SAME Solana transaction as the payment above, or access will be denied."
+  }
+}
+```
+
+The agent must send **both transfers in one Solana transaction** — the vendor payment and the platform fee, correlated purely by both appearing in the transaction the gate fetches, not by a shared memo. A transaction carrying only the vendor leg is treated exactly like an unpaid request (same 402, not a special error).
+
+This field is intentionally **not** part of the standards-compliant `accepts[]` array or `X-PAYMENT-REQUIRED` header — those remain vendor-leg-only in every case, so generic x402 clients aren't misled into treating the fee wallet as an alternative payment destination.
+
 ## Error Responses
 
 ### `403 Forbidden` — Invalid Agent Key

@@ -82,6 +82,12 @@ export default { fetch: (req, env, ctx) => gate(req, env, ctx) };
 | `SOLANA_RPC_URL` | No | Custom Solana RPC endpoint. Defaults by debug flag. |
 | `USDC_MINT` | No | Custom USDC mint address. Defaults by debug flag. |
 | `DEBUG` | No | `"true"` = devnet. `"false"` = mainnet (default varies by adapter). |
+| `AGENTPAYMENTS_API_KEY` | No | AgentPayments hosted-platform API key (`ap_live_...`). When set, agent keys are issued and metered via the platform instead of self-signed locally. See **Hosted Platform Mode** below. |
+| `AGENTPAYMENTS_PLATFORM_URL` | No | Override for a self-hosted platform API. |
+
+## Hosted Platform Mode
+
+Setting `AGENTPAYMENTS_API_KEY` switches agent-key issuance from local (`ag_...`) to platform-issued (`agp_...`), and — when the platform account has an on-chain fee configured — every 402 response's custom `payment` object gains a `platform_fee` field describing a second required USDC transfer, to be sent in the **same Solana transaction** as the vendor payment. Missing that second transfer is treated as an unpaid request, same as any other invalid payment. This is opt-in per vendor account and has no effect on self-hosted deployments (no `AGENTPAYMENTS_API_KEY`). The standards-compliant `accepts[]`/`X-PAYMENT-REQUIRED` x402 fields are untouched — they still describe only the vendor leg.
 
 ## Security Features
 
