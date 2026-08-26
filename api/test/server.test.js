@@ -35,6 +35,15 @@ test.after(() => {
   fs.rmSync(process.env.DATA_FILE, { force: true });
 });
 
+test('/v1/account returns platformFeeWallet: null when PLATFORM_FEE_WALLET is unset', async () => {
+  resetStore();
+  const reg = await register({ email: 'no-fee-vendor@test.com', name: 'No Fee Vendor' });
+  const account = await request(app).get('/v1/account').set('Authorization', `Bearer ${reg.body.apiKey}`);
+  assert.equal(account.status, 200);
+  assert.equal(account.body.platformFeeWallet, null);
+  assert.equal(account.body.platformFeeRatePct, null);
+});
+
 test('register -> issue key -> verify key -> usage flow (no Stripe, no email)', async () => {
   resetStore();
 

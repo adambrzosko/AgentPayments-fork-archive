@@ -26,6 +26,13 @@
  *   STRIPE_PRICE_ID         optional — Stripe metered price ID (see stripe-billing.js)
  *   STRIPE_METER_ID         optional — Stripe Billing Meter ID (see stripe-billing.js)
  *   STRIPE_METER_EVENT_NAME optional — Stripe Billing Meter event name
+ *   PLATFORM_FEE_WALLET     optional — base58 Solana address that collects the on-chain
+ *                           platform fee. Unset means fee enforcement is off for every
+ *                           hosted vendor (doubles as a global kill switch). Vendors'
+ *                           SDKs pick this up via GET /v1/account — no SDK release
+ *                           needed to turn it on, rotate it, or turn it off.
+ *   PLATFORM_FEE_RATE_PCT   optional — default 2. Only meaningful when
+ *                           PLATFORM_FEE_WALLET is set.
  *   PORT                    optional — default 3001
  *
  * Rotating PLATFORM_MASTER_SECRET invalidates all existing dashboard sessions and any
@@ -58,6 +65,15 @@ const masterSecret = process.env.PLATFORM_MASTER_SECRET;
 
 // Email verification is enforced only when SMTP is configured.
 const emailVerificationRequired = Boolean(process.env.SMTP_HOST);
+
+// On-chain platform fee: unset PLATFORM_FEE_WALLET means fee enforcement is off for
+// every hosted vendor. See the env var docs above.
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+if (process.env.PLATFORM_FEE_WALLET && !SOLANA_ADDRESS_RE.test(process.env.PLATFORM_FEE_WALLET)) {
+  throw new Error('PLATFORM_FEE_WALLET is set but is not a valid-looking Solana address.');
+}
+const platformFeeWallet = process.env.PLATFORM_FEE_WALLET || null;
+const platformFeeRatePct = platformFeeWallet ? Number(process.env.PLATFORM_FEE_RATE_PCT || '2') : null;
 
 // Dashboard session TTL: 8 hours
 const DASHBOARD_SESSION_TTL = 8 * 60 * 60 * 1000;
@@ -338,6 +354,8 @@ app.get('/v1/account', authenticate, async (req, res, next) => {
       name: v.name,
       plan: v.plan,
       verificationSecret: v.verification_secret || v.verificationSecret,
+      platformFeeWallet,
+      platformFeeRatePct,
       emailVerified: v.email_verified ?? v.emailVerified,
       usage: {
         keysIssued: v.keys_issued ?? v.keysIssued,
@@ -515,6 +533,7 @@ if (require.main === module) {
       store: process.env.DATABASE_URL ? 'postgres' : 'json-file',
       emailVerification: emailVerificationRequired,
       stripeBilling: Boolean(process.env.STRIPE_SECRET_KEY),
+      onChainFee: Boolean(platformFeeWallet),
     }));
   });
 }
